@@ -1086,6 +1086,17 @@ async def quotas_rv069u_country_aggregated(req: QuotaRequest, mode: str) -> Dict
 
 app = FastAPI(title="Norstat Quota API (RV0240 exact-age; RV022U+RV0231U agegroups; RV069U aggregated buckets)")
 
+@app.get("/")
+async def root():
+    return {
+        "ok": True,
+        "message": "Quota API is running",
+        "docs": "/docs",
+        "health": "/health"
+    }
+
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
