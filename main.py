@@ -1,4 +1,5 @@
 ﻿from fastapi import FastAPI, Header, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from typing import Any, Dict, List, Optional, Tuple
@@ -1084,6 +1085,20 @@ async def quotas_rv069u_country_aggregated(req: QuotaRequest, mode: str) -> Dict
 # ================= APP =================
 
 app = FastAPI(title="Norstat Quota API (RV0240 exact-age; RV022U+RV0231U agegroups; RV069U aggregated buckets)")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        # If you deployed frontend (Vercel/Netlify), add it here:
+        # "https://YOUR-FRONTEND-DOMAIN",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 @app.exception_handler(Exception)
 async def handler(req, exc):
