@@ -1096,19 +1096,19 @@ async def root():
     }
 
 
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:3000",
         "http://127.0.0.1:3000",
-        # If you deployed frontend (Vercel/Netlify), add it here:
-        # "https://YOUR-FRONTEND-DOMAIN",
+        "https://quota-frontend-iota.vercel.app",
     ],
+    allow_origin_regex=r"^https://.*\.vercel\.app$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 
 @app.exception_handler(Exception)
