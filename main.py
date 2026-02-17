@@ -470,7 +470,7 @@ async def quotas_from_rv0240_base_agegroup_and_sex(req: QuotaRequest) -> Dict[st
             base=age_base,
             cells=age_cells,
             notes=[
-                "Bucketing: step=1 => every age separate; otherwise first bucket ends at 24, then step buckets from 25+.",
+                "Bucketing: first bucket ends at age 24 unless bucketing chosen has step is 1 year",
             ],
         ).model_dump()
 
@@ -658,7 +658,7 @@ async def quotas_rv0240_tallinn_districts(req: QuotaRequest) -> Dict[str, Any]:
 # - Pealinn = Tallinn
 # - Suurlinnad = Tartu, Pärnu, Narva, Kohtla-Järve
 # - Muu linn = (linnaline asustuspiirkond + väikelinnaline asustuspiirkond) - (Pealinn + Suurlinnad)
-# - Maa = maaline asustuspiirkond  (NOT residual)
+# - Maa = maaline asustuspiirkond 
 async def quotas_rv0240_settlement_type4(req: QuotaRequest) -> Dict[str, Any]:
     meta = await px_meta("RV0240")
     vars_ = meta.get("variables", [])
@@ -746,9 +746,9 @@ async def quotas_rv0240_settlement_type4(req: QuotaRequest) -> Dict[str, Any]:
     out_pops = [capital_pop, big_pop, muu_linn_pop, maa_pop]
 
     notes = [
-        f"Suurlinnad used: {', '.join(sorted(list(BIG_CITIES)))}" + (f" (missing: {', '.join(missing_big)})" if missing_big else ""),
+        f"Suurlinnad: {', '.join(sorted(list(BIG_CITIES)))}" + (f" (missing: {', '.join(missing_big)})" if missing_big else ""),
         "Muu linn = (linnaline asustuspiirkond + väikelinnaline asustuspiirkond) - (pealinn + suurlinnad).",
-        "Maa = maaline asustuspiirkond (not residual).",
+        "Maa = maaline asustuspiirkond.",
     ]
     base, cells = compute_cells(out_ids, out_labs, out_pops, req.sample_n)
     return {
@@ -932,7 +932,7 @@ async def quotas_nationality(req: QuotaRequest) -> Dict[str, Any]:
     notes = []
     notes.extend(age_notes)
     notes.extend(geo_notes)
-    notes.append("Totals are excluded. Rahvus teadmata is EXCLUDED.")
+    notes.append("Unknown Nationality is EXCLUDED.")
     notes.append(f"Skipped teadmata pop: {teadmata_skipped}")
 
     base, cells = compute_cells(out_ids, out_labels, out_pops, req.sample_n)
@@ -1011,7 +1011,7 @@ async def quotas_education(req: QuotaRequest) -> Dict[str, Any]:
     notes = []
     notes.extend(age_notes)
     notes.extend(geo_notes)
-    notes.append("Education includes ONLY IDs 2, 7, 11. 'Teadmata' is excluded.")
+    notes.append("Education Unknown is excluded.")
 
     base, cells = compute_cells(f_ids, f_labs, f_pops, req.sample_n)
     return {"population_total": base, "results": {"education": DimensionResult(base=base, cells=cells, notes=notes).model_dump()}, "meta": {"source": table, "sex_filter": req.sex_filter}}
