@@ -16,10 +16,6 @@ ALLOWED_EDUCATION_IDS = {"2", "7", "11"}  # requested
 
 CAPITAL_CITY = "Tallinn"
 BIG_CITIES = {"Tartu", "Narva", "Pärnu", "Kohtla-Järve"}
-COUNTY_CENTERS = {
-    "Rakvere", "Jõhvi", "Paide", "Jõgeva", "Haapsalu", "Kuressaare",
-    "Põlva", "Rapla", "Viljandi", "Võru", "Valga", "Kärdla"
-}
 REGION5 = {"Põhja-Eesti", "Kirde-Eesti", "Kesk-Eesti", "Lõuna-Eesti", "Lääne-Eesti"}
 
 
@@ -38,6 +34,11 @@ class QuotaRequest(BaseModel):
     sample_n: int = Field(..., gt=0)
     age_grouping_years: int = Field(10, ge=1, le=100)  # supports 1
     dimensions: List[str] = Field(default_factory=lambda: ["sex", "age_group"])
+
+    sex_filter: str = Field(
+        default="total",
+        description="Sex filter: total | men | women (aliases: kokku/mehed/naised, m/f, male/female)."
+    )
 
 class QuotaCell(BaseModel):
     id: str
@@ -200,6 +201,20 @@ def choose_men_women_codes(sex_var: Dict[str, Any]) -> Tuple[str, str]:
         raise HTTPException(status_code=500, detail={"msg": "Could not detect 'Mehed'/'Naised' codes.", "texts_preview": txts[:25]})
     return men, women
 
+def resolve_sex_values(sex_var: Dict[str, Any], sex_filter: Optional[str]) -> Tuple[List[str], List[str]]:
+    f = fold(sex_filter or "total")
+    total_code = choose_total_sex_code(sex_var)
+    men_code, women_code = choose_men_women_codes(sex_var)
+
+    if f in {"total", "all", "both", "kokku", "mehed ja naised", "mehedjanaised"}:
+        return [total_code], []
+    if f in {"men", "mehed", "m", "male"}:
+        return [men_code], []
+    if f in {"women", "naised", "f", "female"}:
+        return [women_code], []
+
+    raise HTTPException(status_code=400, detail={"msg": "Invalid sex_filter. Use: total | men | women", "sex_filter": sex_filter})
+
 def pick_kogu_eesti_code(values: List[str], value_texts: List[str]) -> Optional[str]:
     for code, txt in zip(values, value_texts):
         if fold(clean_value_text(txt)) == "kogu eesti":
@@ -330,8 +345,7 @@ def rv0240_detect_residence_lists(meta_vars: List[Dict[str, Any]]) -> Tuple[Dict
     txts = res_var.get("valueTexts", vals) or []
     code_to_text = {}
     for c, t in zip(vals, txts):
-        ct = clean_value_text(t)
-        code_to_text[str(c)] = ct
+        code_to_text[str(c)] = clean_value_text(t)
     return code_to_text, res_code
 
 def is_county_label(label: str) -> bool:
@@ -360,6 +374,35 @@ def is_region5_label(label: str) -> bool:
 def city_match_exact(label: str, city: str) -> bool:
     l = label.strip()
     return l == city or l == f"{city} linn"
+
+
+# ================= NEW HELPERS for Harju without Tallinn =================
+
+def find_county_code_exact(code_to_text: Dict[str, str], county_name: str) -> Optional[str]:
+    target = fold(county_name)
+    for c, t in code_to_text.items():
+        if fold(clean_value_text(t)) == target:
+            return str(c)
+    return None
+
+def find_city_code_exact(code_to_text: Dict[str, str], city: str) -> Optional[str]:
+    for c, t in code_to_text.items():
+        if city_match_exact(clean_value_text(t), city):
+            return str(c)
+    return None
+
+def find_res_code_contains(code_to_text: Dict[str, str], required_substrings: List[str]) -> Optional[str]:
+    """
+    Find a residence code whose cleaned label contains ALL required substrings (folded).
+    Example:
+      required_substrings=["linnaline", "asustuspiirkond"]
+    """
+    req = [fold(x) for x in required_substrings]
+    for c, t in code_to_text.items():
+        tt = fold(clean_value_text(t))
+        if all(r in tt for r in req):
+            return str(c)
+    return None
 
 
 # ================= Base: RV0240 age_group + sex =================
@@ -391,12 +434,12 @@ async def quotas_from_rv0240_base_agegroup_and_sex(req: QuotaRequest) -> Dict[st
     wanted_ages = [str(a) for a in range(a_from, a_to + 1)]
     results: Dict[str, Any] = {}
 
-    total_sex_code = choose_total_sex_code(sex_var)
+    sex_values, _ = resolve_sex_values(sex_var, req.sex_filter)
 
     js = await rv0240_fetch(
         year=req.reference.year,
         wanted_ages=wanted_ages,
-        sex_values=[total_sex_code],
+        sex_values=sex_values,
         residence_values=residence_filter,
     )
 
@@ -427,8 +470,6 @@ async def quotas_from_rv0240_base_agegroup_and_sex(req: QuotaRequest) -> Dict[st
             base=age_base,
             cells=age_cells,
             notes=[
-                "Sex forced to 'Mehed ja naised' (not summed).",
-                "RV0240 uses exact ages (not age groups).",
                 "Bucketing: step=1 => every age separate; otherwise first bucket ends at 24, then step buckets from 25+.",
             ],
         ).model_dump()
@@ -445,14 +486,28 @@ async def quotas_from_rv0240_base_agegroup_and_sex(req: QuotaRequest) -> Dict[st
         for coords, v in rows2:
             pop_by_sex[sex_keys[coords[s_pos]]] += v
 
-        out_ids = [men_code, women_code]
-        out_labs = [
-            clean_value_text(sex_labels_map.get(men_code, "Mehed")),
-            clean_value_text(sex_labels_map.get(women_code, "Naised")),
-        ]
-        out_pops = [pop_by_sex.get(men_code, 0), pop_by_sex.get(women_code, 0)]
+        f = fold(req.sex_filter or "total")
+        if f in {"men", "mehed", "m", "male"}:
+            out_ids = [men_code]
+            out_labs = [clean_value_text(sex_labels_map.get(men_code, "Mehed"))]
+            out_pops = [pop_by_sex.get(men_code, 0)]
+            notes = []
+        elif f in {"women", "naised", "f", "female"}:
+            out_ids = [women_code]
+            out_labs = [clean_value_text(sex_labels_map.get(women_code, "Naised"))]
+            out_pops = [pop_by_sex.get(women_code, 0)]
+            notes = []
+        else:
+            out_ids = [men_code, women_code]
+            out_labs = [
+                clean_value_text(sex_labels_map.get(men_code, "Mehed")),
+                clean_value_text(sex_labels_map.get(women_code, "Naised")),
+            ]
+            out_pops = [pop_by_sex.get(men_code, 0), pop_by_sex.get(women_code, 0)]
+            notes = []
+
         s_base, s_cells = compute_cells(out_ids, out_labs, out_pops, req.sample_n)
-        results["sex"] = DimensionResult(base=s_base, cells=s_cells, notes=["Sex is NOT summed."]).model_dump()
+        results["sex"] = DimensionResult(base=s_base, cells=s_cells, notes=notes).model_dump()
 
     return {
         "population_total": population_total,
@@ -462,12 +517,14 @@ async def quotas_from_rv0240_base_agegroup_and_sex(req: QuotaRequest) -> Dict[st
             "year": req.reference.year,
             "age_band": {"from": a_from, "to": a_to},
             "bucket_years": int(req.age_grouping_years),
+            "sex_filter": req.sex_filter,
         },
     }
 
 
 # ================= RV0240 derived dims =================
 
+# county: Tallinn + Harju (ilma Tallinnata) FIRST
 async def quotas_rv0240_county(req: QuotaRequest) -> Dict[str, Any]:
     meta = await px_meta("RV0240")
     vars_ = meta.get("variables", [])
@@ -476,29 +533,70 @@ async def quotas_rv0240_county(req: QuotaRequest) -> Dict[str, Any]:
 
     a_from, a_to = req.age_band.from_age, req.age_band.to_age
     wanted_ages = [str(a) for a in range(a_from, a_to + 1)]
-    total_sex_code = choose_total_sex_code(sex_var)
+    sex_values, _ = resolve_sex_values(sex_var, req.sex_filter)
 
-    county_codes = [c for c, t in code_to_text.items() if is_county_label(t)]
+    county_codes = [
+        c for c, t in code_to_text.items()
+        if is_county_label(t) and fold(t) not in {"maakond teadmata", "teadmata"}
+    ]
     if not county_codes:
         raise HTTPException(status_code=500, detail={"msg": "No county codes detected in RV0240."})
 
-    js = await rv0240_fetch(req.reference.year, wanted_ages, [total_sex_code], county_codes)
+    harju_code = find_county_code_exact(code_to_text, "Harju maakond")
+    tallinn_code = find_city_code_exact(code_to_text, "Tallinn")
+
+    residence_values = list(county_codes)
+    if tallinn_code and tallinn_code not in residence_values:
+        residence_values.append(tallinn_code)
+
+    js = await rv0240_fetch(req.reference.year, wanted_ages, sex_values, residence_values)
     keys, labs, pops = rv0240_sum_by_dim(js, res_code)
+    pop_by_code = {k: int(p) for k, p in zip(keys, pops)}
 
-    out_ids, out_labs, out_pops = [], [], []
-    for k, lab, pop in zip(keys, labs, pops):
-        if is_county_label(lab):
-            out_ids.append(k)
+    out_ids: List[str] = []
+    out_labs: List[str] = []
+    out_pops: List[int] = []
+
+    if harju_code and tallinn_code:
+        harju_pop = int(pop_by_code.get(harju_code, 0))
+        tallinn_pop = int(pop_by_code.get(tallinn_code, 0))
+        harju_wo = max(0, harju_pop - tallinn_pop)
+
+        out_ids.append(tallinn_code)
+        out_labs.append("Tallinn")
+        out_pops.append(tallinn_pop)
+
+        out_ids.append(harju_code)
+        out_labs.append("Harju Maakond (ilma Tallinnata)")
+        out_pops.append(harju_wo)
+    else:
+        if tallinn_code:
+            out_ids.append(tallinn_code)
+            out_labs.append("Tallinn")
+            out_pops.append(int(pop_by_code.get(tallinn_code, 0)))
+        if harju_code and harju_code in county_codes:
+            lab = clean_value_text(code_to_text.get(harju_code, harju_code))
+            out_ids.append(harju_code)
             out_labs.append(lab.title())
-            out_pops.append(int(pop))
+            out_pops.append(int(pop_by_code.get(harju_code, 0)))
 
-    notes = [
-        "RV0240 uses exact ages; county sums are exact for requested age range.",
-        "Sex forced to 'Mehed ja naised' (not summed).",
-        "County list excludes asustuspiirkond rows and Tallinn districts (those are separate).",
-    ]
+    for k in county_codes:
+        if harju_code and k == harju_code:
+            continue
+        lab = clean_value_text(code_to_text.get(k, k))
+        if not is_county_label(lab):
+            continue
+        out_ids.append(k)
+        out_labs.append(lab.title())
+        out_pops.append(int(pop_by_code.get(k, 0)))
+
+    notes: List[str] = []
     base, cells = compute_cells(out_ids, out_labs, out_pops, req.sample_n)
-    return {"population_total": base, "results": {"county": DimensionResult(base=base, cells=cells, notes=notes).model_dump()}, "meta": {"source": "RV0240"}}
+    return {
+        "population_total": base,
+        "results": {"county": DimensionResult(base=base, cells=cells, notes=notes).model_dump()},
+        "meta": {"source": "RV0240", "sex_filter": req.sex_filter},
+    }
 
 async def quotas_rv0240_region5(req: QuotaRequest) -> Dict[str, Any]:
     meta = await px_meta("RV0240")
@@ -508,13 +606,13 @@ async def quotas_rv0240_region5(req: QuotaRequest) -> Dict[str, Any]:
 
     a_from, a_to = req.age_band.from_age, req.age_band.to_age
     wanted_ages = [str(a) for a in range(a_from, a_to + 1)]
-    total_sex_code = choose_total_sex_code(sex_var)
+    sex_values, _ = resolve_sex_values(sex_var, req.sex_filter)
 
     region_codes = [c for c, t in code_to_text.items() if is_region5_label(t)]
     if not region_codes:
-        raise HTTPException(status_code=500, detail={"msg": "No region5 codes detected in RV0240.", "expected": sorted(list(REGION5))})
+        raise HTTPException(status_code=500, detail={"msg": "No region codes detected in RV0240.", "expected": sorted(list(REGION5))})
 
-    js = await rv0240_fetch(req.reference.year, wanted_ages, [total_sex_code], region_codes)
+    js = await rv0240_fetch(req.reference.year, wanted_ages, sex_values, region_codes)
     keys, labs, pops = rv0240_sum_by_dim(js, res_code)
 
     out_ids, out_labs, out_pops = [], [], []
@@ -524,12 +622,9 @@ async def quotas_rv0240_region5(req: QuotaRequest) -> Dict[str, Any]:
             out_labs.append(lab)
             out_pops.append(int(pop))
 
-    notes = [
-        "RV0240 uses exact ages; region sums are exact for requested age range.",
-        "Sex forced to 'Mehed ja naised' (not summed).",
-    ]
+    notes = []
     base, cells = compute_cells(out_ids, out_labs, out_pops, req.sample_n)
-    return {"population_total": base, "results": {"region5": DimensionResult(base=base, cells=cells, notes=notes).model_dump()}, "meta": {"source": "RV0240"}}
+    return {"population_total": base, "results": {"region": DimensionResult(base=base, cells=cells, notes=notes).model_dump()}, "meta": {"source": "RV0240", "sex_filter": req.sex_filter}}
 
 async def quotas_rv0240_tallinn_districts(req: QuotaRequest) -> Dict[str, Any]:
     meta = await px_meta("RV0240")
@@ -539,13 +634,13 @@ async def quotas_rv0240_tallinn_districts(req: QuotaRequest) -> Dict[str, Any]:
 
     a_from, a_to = req.age_band.from_age, req.age_band.to_age
     wanted_ages = [str(a) for a in range(a_from, a_to + 1)]
-    total_sex_code = choose_total_sex_code(sex_var)
+    sex_values, _ = resolve_sex_values(sex_var, req.sex_filter)
 
     district_codes = [c for c, t in code_to_text.items() if is_tallinn_district_label(t)]
     if not district_codes:
         raise HTTPException(status_code=500, detail={"msg": "No Tallinn district codes detected in RV0240."})
 
-    js = await rv0240_fetch(req.reference.year, wanted_ages, [total_sex_code], district_codes)
+    js = await rv0240_fetch(req.reference.year, wanted_ages, sex_values, district_codes)
     keys, labs, pops = rv0240_sum_by_dim(js, res_code)
 
     out_ids, out_labs, out_pops = [], [], []
@@ -555,14 +650,15 @@ async def quotas_rv0240_tallinn_districts(req: QuotaRequest) -> Dict[str, Any]:
             out_labs.append(lab)
             out_pops.append(int(pop))
 
-    notes = [
-        "RV0240 uses exact ages; Tallinn district sums are exact for requested age range.",
-        "Sex forced to 'Mehed ja naised' (not summed).",
-        "Tallinn total itself is not included here; only districts.",
-    ]
+    notes = []
     base, cells = compute_cells(out_ids, out_labs, out_pops, req.sample_n)
-    return {"population_total": base, "results": {"tallinn_districts": DimensionResult(base=base, cells=cells, notes=notes).model_dump()}, "meta": {"source": "RV0240"}}
+    return {"population_total": base, "results": {"tallinn_districts": DimensionResult(base=base, cells=cells, notes=notes).model_dump()}, "meta": {"source": "RV0240", "sex_filter": req.sex_filter}}
 
+# UPDATED per your rules:
+# - Pealinn = Tallinn
+# - Suurlinnad = Tartu, Pärnu, Narva, Kohtla-Järve
+# - Muu linn = (linnaline asustuspiirkond + väikelinnaline asustuspiirkond) - (Pealinn + Suurlinnad)
+# - Maa = maaline asustuspiirkond  (NOT residual)
 async def quotas_rv0240_settlement_type4(req: QuotaRequest) -> Dict[str, Any]:
     meta = await px_meta("RV0240")
     vars_ = meta.get("variables", [])
@@ -572,7 +668,7 @@ async def quotas_rv0240_settlement_type4(req: QuotaRequest) -> Dict[str, Any]:
 
     a_from, a_to = req.age_band.from_age, req.age_band.to_age
     wanted_ages = [str(a) for a in range(a_from, a_to + 1)]
-    total_sex_code = choose_total_sex_code(sex_var)
+    sex_values, _ = resolve_sex_values(sex_var, req.sex_filter)
 
     res_values = res_var.get("values", []) or []
     res_texts = res_var.get("valueTexts", res_values) or []
@@ -580,63 +676,86 @@ async def quotas_rv0240_settlement_type4(req: QuotaRequest) -> Dict[str, Any]:
     if not kogu_eesti_code:
         raise HTTPException(status_code=500, detail="Could not find 'Kogu Eesti' in RV0240.")
 
-    def find_city_code(city: str) -> Optional[str]:
-        for c, t in code_to_text.items():
-            if city_match_exact(t, city):
-                return c
-        return None
-
-    tallinn_code = find_city_code("Tallinn")
+    # Exact city codes
+    tallinn_code = find_city_code_exact(code_to_text, "Tallinn")
     if not tallinn_code:
         raise HTTPException(status_code=500, detail={"msg": "Could not find Tallinn code in RV0240 residence list."})
 
-    big_city_codes, missing_big = [], []
-    for city in BIG_CITIES:
-        cc = find_city_code(city)
+    big_city_codes: List[str] = []
+    missing_big: List[str] = []
+    for city in sorted(BIG_CITIES):
+        cc = find_city_code_exact(code_to_text, city)
         if cc:
             big_city_codes.append(cc)
         else:
             missing_big.append(city)
 
-    small_city_codes, missing_small = [], []
-    for city in COUNTY_CENTERS:
-        cc = find_city_code(city)
-        if cc:
-            small_city_codes.append(cc)
-        else:
-            missing_small.append(city)
+    # Settlement-type category codes
+    linnaline_code = (
+        find_res_code_contains(code_to_text, ["linnaline", "asustuspiirkond"])
+        or find_res_code_contains(code_to_text, ["linnaline"])
+    )
+    vaikelinnaline_code = (
+        find_res_code_contains(code_to_text, ["vaikelinnaline", "asustuspiirkond"])
+        or find_res_code_contains(code_to_text, ["väikelinnaline", "asustuspiirkond"])
+        or find_res_code_contains(code_to_text, ["vaikelinnaline"])
+        or find_res_code_contains(code_to_text, ["väikelinnaline"])
+    )
+    maaline_code = (
+        find_res_code_contains(code_to_text, ["maaline", "asustuspiirkond"])
+        or find_res_code_contains(code_to_text, ["maaline"])
+    )
 
-    needed_codes = [kogu_eesti_code, tallinn_code] + big_city_codes + small_city_codes
+    if not linnaline_code or not vaikelinnaline_code or not maaline_code:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "msg": "Could not detect settlement type codes in RV0240 residence list.",
+                "found": {
+                    "linnaline": linnaline_code,
+                    "vaikelinnaline": vaikelinnaline_code,
+                    "maaline": maaline_code,
+                },
+                "hint": "Check residence valueTexts for 'linnaline/vaikelinnaline/maaline asustuspiirkond'.",
+            },
+        )
+
+    needed_codes = [kogu_eesti_code, tallinn_code] + big_city_codes + [linnaline_code, vaikelinnaline_code, maaline_code]
     needed_codes = list(dict.fromkeys(needed_codes))
 
-    js = await rv0240_fetch(req.reference.year, wanted_ages, [total_sex_code], needed_codes)
+    js = await rv0240_fetch(req.reference.year, wanted_ages, sex_values, needed_codes)
     keys, labs, pops = rv0240_sum_by_dim(js, res_code)
     pop_by_code = {k: int(p) for k, p in zip(keys, pops)}
 
-    total_pop = pop_by_code.get(kogu_eesti_code, 0)
     capital_pop = pop_by_code.get(tallinn_code, 0)
     big_pop = sum(pop_by_code.get(c, 0) for c in big_city_codes)
-    small_pop = sum(pop_by_code.get(c, 0) for c in small_city_codes)
-    rural_pop = max(0, total_pop - (capital_pop + big_pop + small_pop))
 
-    out_ids = ["pealinn", "suurlinn", "vaikelinn", "maa"]
+    linnaline_pop = pop_by_code.get(linnaline_code, 0)
+    vaikelinnaline_pop = pop_by_code.get(vaikelinnaline_code, 0)
+    maa_pop = pop_by_code.get(maaline_code, 0)
+
+    muu_linn_pop = max(0, (linnaline_pop + vaikelinnaline_pop) - (capital_pop + big_pop))
+
+    out_ids = ["pealinn", "suurlinn", "muulinn", "maa"]
     out_labs = [
         "Pealinn (Tallinn)",
-        "Suurlinnad",
-        "Väikelinnad (maakonnakeskused)",
-        "Maa (kõik muu)",
+        "Suurlinnad (Tartu, Pärnu, Narva, Kohtla-Järve)",
+        "Muu linn (linnaline + väikelinnaline, ilma pealinna ja suurlinnadeta)",
+        "Maa (maaline asustuspiirkond)",
     ]
-    out_pops = [capital_pop, big_pop, small_pop, rural_pop]
+    out_pops = [capital_pop, big_pop, muu_linn_pop, maa_pop]
 
     notes = [
-        "RV0240 uses exact ages; settlement_type4 is exact for requested age range.",
-        "Sex forced to 'Mehed ja naised' (not summed).",
-        f"Big cities used: {', '.join(sorted(list(BIG_CITIES)))}" + (f" (missing in table: {', '.join(missing_big)})" if missing_big else ""),
-        f"County centers used: {', '.join(sorted(list(COUNTY_CENTERS)))}" + (f" (missing in table: {', '.join(missing_small)})" if missing_small else ""),
-        "Rural = Kogu Eesti - (capital + big + county centers).",
+        f"Suurlinnad used: {', '.join(sorted(list(BIG_CITIES)))}" + (f" (missing: {', '.join(missing_big)})" if missing_big else ""),
+        "Muu linn = (linnaline asustuspiirkond + väikelinnaline asustuspiirkond) - (pealinn + suurlinnad).",
+        "Maa = maaline asustuspiirkond (not residual).",
     ]
     base, cells = compute_cells(out_ids, out_labs, out_pops, req.sample_n)
-    return {"population_total": base, "results": {"settlement_type4": DimensionResult(base=base, cells=cells, notes=notes).model_dump()}, "meta": {"source": "RV0240"}}
+    return {
+        "population_total": base,
+        "results": {"settlement_type": DimensionResult(base=base, cells=cells, notes=notes).model_dump()},
+        "meta": {"source": "RV0240", "sex_filter": req.sex_filter},
+    }
 
 
 # ================= AGE-GROUP TABLE HELPERS =================
@@ -713,7 +832,6 @@ def make_geo_selection_total_or_eliminate(var: Dict[str, Any]) -> Tuple[Optional
     notes: List[str] = []
     code = find_total_value_code(var)
     if code:
-        notes.append("Geography: using explicit total (Eesti/Kogu Eesti).")
         return ({"filter": "item", "values": [code]}, notes)
     if var.get("elimination", False):
         notes.append("Geography: maakond eliminated (PxWeb elimination) to get Estonia total.")
@@ -749,7 +867,7 @@ async def quotas_nationality(req: QuotaRequest) -> Dict[str, Any]:
     if str(req.reference.year) not in years:
         raise HTTPException(status_code=400, detail={"msg": f"Year {req.reference.year} not available in {table}", "available_years": years})
 
-    total_sex_code = choose_total_sex_code(sex_var)
+    sex_values, _ = resolve_sex_values(sex_var, req.sex_filter)
 
     age_values = ageg_var.get("values", []) or []
     age_texts = ageg_var.get("valueTexts", age_values) or []
@@ -763,7 +881,7 @@ async def quotas_nationality(req: QuotaRequest) -> Dict[str, Any]:
         if code == year_var["code"]:
             query.append({"code": code, "selection": {"filter": "item", "values": [str(req.reference.year)]}})
         elif code == sex_var["code"]:
-            query.append({"code": code, "selection": {"filter": "item", "values": [total_sex_code]}})
+            query.append({"code": code, "selection": {"filter": "item", "values": sex_values}})
         elif code == ageg_var["code"]:
             query.append({"code": code, "selection": {"filter": "item", "values": age_codes}})
         elif code == geo_var["code"]:
@@ -794,7 +912,6 @@ async def quotas_nationality(req: QuotaRequest) -> Dict[str, Any]:
 
         if is_totalish(label) or "rahvus kokku" in t or "rahvused kokku" in t:
             continue
-
         if "teadmata" in t:
             teadmata_skipped += p
             continue
@@ -815,12 +932,11 @@ async def quotas_nationality(req: QuotaRequest) -> Dict[str, Any]:
     notes = []
     notes.extend(age_notes)
     notes.extend(geo_notes)
-    notes.append("Sex forced to 'Mehed ja naised' (not summed).")
     notes.append("Totals are excluded. Rahvus teadmata is EXCLUDED.")
     notes.append(f"Skipped teadmata pop: {teadmata_skipped}")
 
     base, cells = compute_cells(out_ids, out_labels, out_pops, req.sample_n)
-    return {"population_total": base, "results": {"nationality": DimensionResult(base=base, cells=cells, notes=notes).model_dump()}, "meta": {"source": table}}
+    return {"population_total": base, "results": {"nationality": DimensionResult(base=base, cells=cells, notes=notes).model_dump()}, "meta": {"source": table, "sex_filter": req.sex_filter}}
 
 
 # ================= RV0231U education =================
@@ -840,7 +956,7 @@ async def quotas_education(req: QuotaRequest) -> Dict[str, Any]:
     if str(req.reference.year) not in years:
         raise HTTPException(status_code=400, detail={"msg": f"Year {req.reference.year} not available in {table}", "available_years": years})
 
-    total_sex_code = choose_total_sex_code(sex_var)
+    sex_values, _ = resolve_sex_values(sex_var, req.sex_filter)
 
     age_values = ageg_var.get("values", []) or []
     age_texts = ageg_var.get("valueTexts", age_values) or []
@@ -859,7 +975,7 @@ async def quotas_education(req: QuotaRequest) -> Dict[str, Any]:
         if code == year_var["code"]:
             query.append({"code": code, "selection": {"filter": "item", "values": [str(req.reference.year)]}})
         elif code == sex_var["code"]:
-            query.append({"code": code, "selection": {"filter": "item", "values": [total_sex_code]}})
+            query.append({"code": code, "selection": {"filter": "item", "values": sex_values}})
         elif code == ageg_var["code"]:
             query.append({"code": code, "selection": {"filter": "item", "values": age_codes}})
         elif code == geo_var["code"]:
@@ -895,11 +1011,10 @@ async def quotas_education(req: QuotaRequest) -> Dict[str, Any]:
     notes = []
     notes.extend(age_notes)
     notes.extend(geo_notes)
-    notes.append("Sex forced to 'Mehed ja naised' (not summed).")
     notes.append("Education includes ONLY IDs 2, 7, 11. 'Teadmata' is excluded.")
 
     base, cells = compute_cells(f_ids, f_labs, f_pops, req.sample_n)
-    return {"population_total": base, "results": {"education": DimensionResult(base=base, cells=cells, notes=notes).model_dump()}, "meta": {"source": table}}
+    return {"population_total": base, "results": {"education": DimensionResult(base=base, cells=cells, notes=notes).model_dump()}, "meta": {"source": table, "sex_filter": req.sex_filter}}
 
 
 # ================= RV069U birth/citizenship by country (AGGREGATED) =================
@@ -920,31 +1035,19 @@ def pick_birthcit_type_codes(var: Dict[str, Any]) -> Tuple[str, str]:
     return birth, citizen
 
 def is_unknown_country(code: str, label: str) -> bool:
-    # Stat uses XX = Määramata often; but we also check label
     c = str(code).strip().upper()
     t = fold(label)
     return c in {"XX", "UNK"} or "maaramata" in t or "maaramaata" in t or "unknown" in t or "teadmata" in t
 
 def is_eu_excl_ee_bucket(code: str, label: str) -> bool:
-    # In RV069U sample you had id "3" = "EL-i riik (v.a Eesti)"
     t = fold(label)
     return "el-i riik" in t or ("euroopa liit" in t and "v.a eesti" in t) or ("eu" in t and "eesti" in t and "va" in t)
 
 def is_non_eu_bucket(code: str, label: str) -> bool:
-    # In RV069U sample you had id "8" = "Välisriik (v.a EL-i riigid)"
     t = fold(label)
     return "valisriik" in t and "el" in t and ("v.a" in t or "va" in t)
 
 async def quotas_rv069u_country_aggregated(req: QuotaRequest, mode: str) -> Dict[str, Any]:
-    """
-    Output buckets:
-      - EE (Eesti)
-      - EU_excl_EE (EL-i riik (v.a Eesti))
-      - RU (Venemaa)
-      - UA (Ukraina)
-      - NonEU_excl_EU_and_excl_RU_UA (Välisriik (v.a EL-i riigid) minus RU and UA)
-      - UNKNOWN (Määramata)  -> include only for citizenship; exclude for birth (per user)
-    """
     table = "RV069U"
     meta = await px_meta(table)
     vars_ = meta.get("variables", [])
@@ -954,7 +1057,6 @@ async def quotas_rv069u_country_aggregated(req: QuotaRequest, mode: str) -> Dict
     ageg_var = pick_var(vars_, ["vanusrühm", "vanusr", "age group", "agegroup"])
     geo_var = pick_var(vars_, ["maakond", "county"])
 
-    # exact vars
     type_var = pick_var_exact(vars_, "Sünniriik/Kodakondsus")
     country_var = pick_var_exact(vars_, "Riik")
 
@@ -962,7 +1064,7 @@ async def quotas_rv069u_country_aggregated(req: QuotaRequest, mode: str) -> Dict
     if str(req.reference.year) not in years:
         raise HTTPException(status_code=400, detail={"msg": f"Year {req.reference.year} not available in {table}", "available_years": years})
 
-    total_sex_code = choose_total_sex_code(sex_var)
+    sex_values, _ = resolve_sex_values(sex_var, req.sex_filter)
 
     age_values = ageg_var.get("values", []) or []
     age_texts = ageg_var.get("valueTexts", age_values) or []
@@ -979,7 +1081,7 @@ async def quotas_rv069u_country_aggregated(req: QuotaRequest, mode: str) -> Dict
         if code == year_var["code"]:
             query.append({"code": code, "selection": {"filter": "item", "values": [str(req.reference.year)]}})
         elif code == sex_var["code"]:
-            query.append({"code": code, "selection": {"filter": "item", "values": [total_sex_code]}})
+            query.append({"code": code, "selection": {"filter": "item", "values": sex_values}})
         elif code == ageg_var["code"]:
             query.append({"code": code, "selection": {"filter": "item", "values": age_codes}})
         elif code == geo_var["code"]:
@@ -1004,58 +1106,41 @@ async def quotas_rv069u_country_aggregated(req: QuotaRequest, mode: str) -> Dict
     for coords, v in rows:
         pop_by_code[c_keys[coords[c_pos]]] += v
 
-    # aggregate
     ee = 0
     eu_excl_ee = 0
     ru = 0
     ua = 0
     noneu_bucket = 0
     unknown = 0
-    skipped_totals = 0
 
-    # We only trust these bucket rows:
-    # EE, EU bucket (id like 3), Non-EU bucket (id like 8), RU, UA, unknown
-    # Everything else is ignored to avoid double counting (because detailed countries are inside buckets).
     for k in c_keys:
         lab = clean_value_text(c_label_map.get(k, k))
         p = int(pop_by_code.get(k, 0))
         code = str(k).strip().upper()
 
         if is_totalish(lab):
-            skipped_totals += p
             continue
-
         if is_unknown_country(code, lab):
             unknown += p
             continue
-
         if code == "EE":
             ee += p
             continue
-
         if code == "RU":
             ru += p
             continue
-
         if code == "UA":
             ua += p
             continue
-
         if is_eu_excl_ee_bucket(code, lab):
             eu_excl_ee += p
             continue
-
         if is_non_eu_bucket(code, lab):
             noneu_bucket += p
             continue
 
-        # ignore all other detailed country rows to prevent double counting
-
-    # subtract RU/UA from non-eu bucket (as requested)
     non_eu_excl = max(0, noneu_bucket - ru - ua)
-
-    # Output rules for unknown
-    include_unknown = (mode == "citizenship")  # birth: do NOT use unknown
+    include_unknown = (mode == "citizenship")
 
     out_ids = ["EE", "EU_EXCL_EE", "RU", "UA", "NON_EU_EXCL_EU"]
     out_labels = ["Eesti", "EL-i riik (v.a Eesti)", "Venemaa", "Ukraina", "Välisriik (v.a EL-i riigid) (ilma RU/UA)"]
@@ -1066,20 +1151,13 @@ async def quotas_rv069u_country_aggregated(req: QuotaRequest, mode: str) -> Dict
         out_labels.append("Määramata")
         out_pops.append(unknown)
 
-    notes = []
-    notes.append("RV069U is aggregated into buckets to avoid double counting (country details are inside bucket rows).")
+    notes: List[str] = []
     notes.extend(age_notes)
     notes.extend(geo_notes)
-    notes.append("Sex forced to 'Mehed ja naised' (not summed).")
-    notes.append("Uses only: EE, EU bucket (v.a EE), Non-EU bucket (v.a EU), RU, UA, (and XX if enabled).")
-    notes.append("RU and UA are subtracted from Non-EU bucket (because they are inside it).")
-    notes.append(f"Non-EU bucket raw: {noneu_bucket}, RU: {ru}, UA: {ua}, Non-EU after subtraction: {non_eu_excl}.")
-    notes.append(f"Unknown (XX) included: {include_unknown}. Unknown pop: {unknown}.")
-    notes.append(f"Skipped totals pop: {skipped_totals}")
 
     base, cells = compute_cells(out_ids, out_labels, out_pops, req.sample_n)
     key = "birth_country" if mode == "birth" else "citizenship_country"
-    return {"population_total": base, "results": {key: DimensionResult(base=base, cells=cells, notes=notes).model_dump()}, "meta": {"source": table, "mode": key}}
+    return {"population_total": base, "results": {key: DimensionResult(base=base, cells=cells, notes=notes).model_dump()}, "meta": {"source": table, "mode": key, "sex_filter": req.sex_filter}}
 
 
 # ================= APP =================
@@ -1088,13 +1166,7 @@ app = FastAPI(title="Norstat Quota API (RV0240 exact-age; RV022U+RV0231U agegrou
 
 @app.get("/")
 async def root():
-    return {
-        "ok": True,
-        "message": "Quota API is running",
-        "docs": "/docs",
-        "health": "/health"
-    }
-
+    return {"ok": True, "message": "Quota API is running", "docs": "/docs", "health": "/health"}
 
 app.add_middleware(
     CORSMiddleware,
@@ -1108,8 +1180,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
 
 @app.exception_handler(Exception)
 async def handler(req, exc):
@@ -1125,6 +1195,16 @@ async def health():
 async def calculate(req: QuotaRequest, x_api_key: Optional[str] = Header(default=None)):
     require_key(x_api_key)
 
+    normalized = []
+    for d in req.dimensions:
+        if d == "region5":
+            normalized.append("region")
+        elif d == "settlement_type4":
+            normalized.append("settlement_type")
+        else:
+            normalized.append(d)
+    req.dimensions = normalized
+
     base_pack = await quotas_from_rv0240_base_agegroup_and_sex(req)
     population_total = base_pack["population_total"]
 
@@ -1133,12 +1213,11 @@ async def calculate(req: QuotaRequest, x_api_key: Optional[str] = Header(default
 
     supported = {
         "sex", "age_group",
-        "county", "region5", "tallinn_districts", "settlement_type4",
+        "county", "region", "tallinn_districts", "settlement_type",
         "nationality", "education",
         "birth_country", "citizenship_country",
     }
 
-    # RV0240-based
     if "county" in req.dimensions:
         try:
             pack = await quotas_rv0240_county(req)
@@ -1147,13 +1226,13 @@ async def calculate(req: QuotaRequest, x_api_key: Optional[str] = Header(default
         except HTTPException as e:
             meta["errors"]["county"] = e.detail
 
-    if "region5" in req.dimensions:
+    if "region" in req.dimensions:
         try:
             pack = await quotas_rv0240_region5(req)
             results.update(pack["results"])
             meta["sources"].append(pack["meta"])
         except HTTPException as e:
-            meta["errors"]["region5"] = e.detail
+            meta["errors"]["region"] = e.detail
 
     if "tallinn_districts" in req.dimensions:
         try:
@@ -1163,15 +1242,14 @@ async def calculate(req: QuotaRequest, x_api_key: Optional[str] = Header(default
         except HTTPException as e:
             meta["errors"]["tallinn_districts"] = e.detail
 
-    if "settlement_type4" in req.dimensions:
+    if "settlement_type" in req.dimensions:
         try:
             pack = await quotas_rv0240_settlement_type4(req)
             results.update(pack["results"])
             meta["sources"].append(pack["meta"])
         except HTTPException as e:
-            meta["errors"]["settlement_type4"] = e.detail
+            meta["errors"]["settlement_type"] = e.detail
 
-    # Age-group based
     if "nationality" in req.dimensions:
         try:
             pack = await quotas_nationality(req)
@@ -1188,7 +1266,6 @@ async def calculate(req: QuotaRequest, x_api_key: Optional[str] = Header(default
         except HTTPException as e:
             meta["errors"]["education"] = e.detail
 
-    # RV069U aggregated
     if "birth_country" in req.dimensions:
         try:
             pack = await quotas_rv069u_country_aggregated(req, mode="birth")
@@ -1205,7 +1282,6 @@ async def calculate(req: QuotaRequest, x_api_key: Optional[str] = Header(default
         except HTTPException as e:
             meta["errors"]["citizenship_country"] = e.detail
 
-    # Unsupported
     for d in req.dimensions:
         if d not in supported and d not in meta["errors"]:
             meta["errors"][d] = {"msg": "Unsupported dimension (not implemented in this version).", "supported": sorted(list(supported))}
@@ -1214,7 +1290,7 @@ async def calculate(req: QuotaRequest, x_api_key: Optional[str] = Header(default
     seen = set()
     uniq = []
     for s in meta["sources"]:
-        key = (s.get("source"), s.get("mode"))
+        key = (s.get("source"), s.get("mode"), s.get("sex_filter"))
         if key in seen:
             continue
         seen.add(key)
