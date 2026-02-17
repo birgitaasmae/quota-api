@@ -470,7 +470,7 @@ async def quotas_from_rv0240_base_agegroup_and_sex(req: QuotaRequest) -> Dict[st
             base=age_base,
             cells=age_cells,
             notes=[
-                "Bucketing: first bucket ends at age 24 unless chosen bucketing has step 1 year",
+                "Bucketing: first bucket ends at age 24 unless chosen age grouping is 1 year",
             ],
         ).model_dump()
 
