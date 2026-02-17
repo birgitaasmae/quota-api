@@ -10,7 +10,7 @@ import unicodedata
 
 PXWEB_BASE = "https://andmed.stat.ee/api/v1/et/stat"
 API_KEY = ""
-DEFAULT_YEAR = 2024
+DEFAULT_YEAR = 2025
 
 ALLOWED_EDUCATION_IDS = {"2", "7", "11"}  # requested
 
@@ -470,7 +470,7 @@ async def quotas_from_rv0240_base_agegroup_and_sex(req: QuotaRequest) -> Dict[st
             base=age_base,
             cells=age_cells,
             notes=[
-                "Bucketing: first bucket ends at age 24 unless bucketing chosen has step is 1 year",
+                "Bucketing: first bucket ends at age 24 unless chosen bucketing has step 1 year",
             ],
         ).model_dump()
 
