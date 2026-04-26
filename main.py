@@ -39,6 +39,10 @@ class QuotaRequest(BaseModel):
         default=None,
         description="Optional county filter, for example 'Harju maakond'. Supported where the source table allows county as a filter.",
     )
+    nationality_filter: str = Field(
+        default="all",
+        description="Nationality filter for supported nationality calculations: all | estonian | russian | ukrainian | other.",
+    )
 
     sex_filter: str = Field(
         default="total",
@@ -981,6 +985,35 @@ def is_totalish(label: str) -> bool:
     t = fold(label)
     return t == "kokku" or "kokku" in t or t == "total" or "total" in t
 
+def normalize_nationality_filter(value: Optional[str]) -> str:
+    f = fold(value or "all")
+    mapping = {
+        "all": "all",
+        "total": "all",
+        "estonian": "estonian",
+        "estonians": "estonian",
+        "eestlane": "estonian",
+        "eestlased": "estonian",
+        "russian": "russian",
+        "russians": "russian",
+        "venelane": "russian",
+        "venelased": "russian",
+        "ukrainian": "ukrainian",
+        "ukrainians": "ukrainian",
+        "ukrainlane": "ukrainian",
+        "ukrainlased": "ukrainian",
+        "other": "other",
+        "others": "other",
+        "muu": "other",
+        "muud": "other",
+    }
+    if f not in mapping:
+        raise HTTPException(
+            status_code=400,
+            detail={"msg": "Invalid nationality_filter. Use: all | estonian | russian | ukrainian | other", "nationality_filter": value},
+        )
+    return mapping[f]
+
 
 # ================= RV022U nationality =================
 
@@ -1057,18 +1090,36 @@ async def quotas_nationality(req: QuotaRequest) -> Dict[str, Any]:
         else:
             muud += p
 
-    out_ids = ["eestlased", "venelased", "ukrainlased", "muud"]
-    out_labels = ["Eestlased", "Venelased", "Ukrainlased", "Muud rahvused"]
-    out_pops = [eestlased, venelased, ukrainlased, muud]
+    grouped = [
+        ("estonian", "Eestlased", eestlased),
+        ("russian", "Venelased", venelased),
+        ("ukrainian", "Ukrainlased", ukrainlased),
+        ("other", "Muud rahvused", muud),
+    ]
+    chosen_filter = normalize_nationality_filter(req.nationality_filter)
+    if chosen_filter == "all":
+        selected = grouped
+    else:
+        selected = [item for item in grouped if item[0] == chosen_filter]
+
+    out_ids = [item[0] for item in selected]
+    out_labels = [item[1] for item in selected]
+    out_pops = [item[2] for item in selected]
 
     notes = []
     notes.extend(age_notes)
     notes.extend(geo_notes)
+    if chosen_filter != "all":
+        notes.append(f"Nationality filter applied: {chosen_filter}.")
     notes.append("Unknown Nationality is EXCLUDED.")
     notes.append(f"Skipped teadmata pop: {teadmata_skipped}")
 
     base, cells = compute_cells(out_ids, out_labels, out_pops, req.sample_n)
-    return {"population_total": base, "results": {"nationality": DimensionResult(base=base, cells=cells, notes=notes).model_dump()}, "meta": {"source": table, "sex_filter": req.sex_filter}}
+    return {
+        "population_total": base,
+        "results": {"nationality": DimensionResult(base=base, cells=cells, notes=notes).model_dump()},
+        "meta": {"source": table, "sex_filter": req.sex_filter, "county_filter": req.county_filter, "nationality_filter": chosen_filter},
+    }
 
 
 # ================= RV0231U education =================
