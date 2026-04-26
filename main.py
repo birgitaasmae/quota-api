@@ -34,6 +34,11 @@ class QuotaRequest(BaseModel):
     sample_n: int = Field(..., gt=0)
     age_grouping_years: int = Field(10, ge=1, le=100)  # supports 1
     dimensions: List[str] = Field(default_factory=lambda: ["sex", "age_group"])
+    custom_age_groups: List[AgeBand] = Field(default_factory=list)
+    county_filter: Optional[str] = Field(
+        default=None,
+        description="Optional county filter, for example 'Harju maakond'. Supported where the source table allows county as a filter.",
+    )
 
     sex_filter: str = Field(
         default="total",
@@ -99,6 +104,55 @@ def compute_cells(ids: List[str], labels: List[str], pops: List[int], n: int) ->
         for i in range(len(shares))
     ]
     return base, cells
+
+def validate_age_band(age_band: AgeBand) -> Tuple[int, int]:
+    a_from, a_to = age_band.from_age, age_band.to_age
+    if a_from > a_to:
+        raise HTTPException(status_code=400, detail="age_band.from must be <= age_band.to")
+    return a_from, a_to
+
+def get_requested_age_spans(req: QuotaRequest) -> List[Tuple[int, int]]:
+    if not req.custom_age_groups:
+        return [validate_age_band(req.age_band)]
+
+    spans: List[Tuple[int, int]] = []
+    for band in req.custom_age_groups:
+        spans.append(validate_age_band(band))
+
+    spans.sort(key=lambda item: (item[0], item[1]))
+    for i in range(1, len(spans)):
+        prev = spans[i - 1]
+        cur = spans[i]
+        if cur[0] <= prev[1]:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "msg": "custom_age_groups must not overlap.",
+                    "overlap": [{"from": prev[0], "to": prev[1]}, {"from": cur[0], "to": cur[1]}],
+                },
+            )
+    return spans
+
+def get_requested_age_bounds(req: QuotaRequest) -> Tuple[int, int]:
+    spans = get_requested_age_spans(req)
+    return spans[0][0], spans[-1][1]
+
+def get_requested_age_values(req: QuotaRequest) -> List[str]:
+    values: List[str] = []
+    for start, end in get_requested_age_spans(req):
+        for age in range(start, end + 1):
+            values.append(str(age))
+    return values
+
+def get_output_age_buckets(req: QuotaRequest) -> List[Tuple[int, int]]:
+    spans = get_requested_age_spans(req)
+    if req.custom_age_groups:
+        return spans
+    a_from, a_to = spans[0]
+    return make_buckets_first_to_24(a_from, a_to, int(req.age_grouping_years))
+
+def requested_age_spans_label(spans: List[Tuple[int, int]]) -> str:
+    return ", ".join(f"{start}-{end}" for start, end in spans)
 
 async def px_meta(table: str) -> Dict[str, Any]:
     async with httpx.AsyncClient(timeout=30) as c:
@@ -404,6 +458,47 @@ def find_res_code_contains(code_to_text: Dict[str, str], required_substrings: Li
             return str(c)
     return None
 
+def find_value_code_exact(values: List[str], value_texts: List[str], wanted: str) -> Optional[Tuple[str, str]]:
+    target = fold(wanted)
+    for code, txt in zip(values, value_texts):
+        label = clean_value_text(txt)
+        if fold(label) == target or fold(str(code)) == target:
+            return str(code), label
+    return None
+
+def resolve_rv0240_county_filter(meta_vars: List[Dict[str, Any]], county_filter: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    if not county_filter:
+        return None, None
+    code_to_text, _ = rv0240_detect_residence_lists(meta_vars)
+    for code, label in code_to_text.items():
+        clean = clean_value_text(label)
+        if not is_county_label(clean):
+            continue
+        if fold(clean) == fold(county_filter) or fold(str(code)) == fold(county_filter):
+            return str(code), clean
+    available = sorted(clean_value_text(t).title() for t in code_to_text.values() if is_county_label(clean_value_text(t)))
+    raise HTTPException(
+        status_code=400,
+        detail={"msg": "Unknown county_filter for RV0240.", "county_filter": county_filter, "available_counties": available},
+    )
+
+def resolve_generic_county_selection(var: Dict[str, Any], county_filter: Optional[str]) -> Tuple[Optional[Dict[str, Any]], List[str]]:
+    notes: List[str] = []
+    if county_filter:
+        values = var.get("values", []) or []
+        texts = var.get("valueTexts", values) or []
+        found = find_value_code_exact(values, texts, county_filter)
+        if not found:
+            available = sorted(clean_value_text(t) for t in texts)
+            raise HTTPException(
+                status_code=400,
+                detail={"msg": "Unknown county_filter.", "county_filter": county_filter, "available_counties": available[:80]},
+            )
+        code, label = found
+        notes.append(f"County filter: {label}.")
+        return {"filter": "item", "values": [code]}, notes
+    return make_geo_selection_total_or_eliminate(var)
+
 
 # ================= Base: RV0240 age_group + sex =================
 
@@ -420,18 +515,21 @@ async def quotas_from_rv0240_base_agegroup_and_sex(req: QuotaRequest) -> Dict[st
     if str(req.reference.year) not in years:
         raise HTTPException(status_code=400, detail={"msg": f"Year {req.reference.year} not available in RV0240", "available_years": years})
 
-    a_from, a_to = req.age_band.from_age, req.age_band.to_age
-    if a_from > a_to:
-        raise HTTPException(status_code=400, detail="age_band.from must be <= age_band.to")
+    age_spans = get_requested_age_spans(req)
+    a_from, a_to = age_spans[0][0], age_spans[-1][1]
 
     res_values = res_var.get("values", [])
     res_texts = res_var.get("valueTexts", res_values)
-    kogu_eesti = pick_kogu_eesti_code(res_values, res_texts)
-    if not kogu_eesti:
-        raise HTTPException(status_code=500, detail="Could not find 'Kogu Eesti' in RV0240.")
-    residence_filter = [kogu_eesti]
+    county_code, county_label = resolve_rv0240_county_filter(vars_, req.county_filter)
+    if county_code:
+        residence_filter = [county_code]
+    else:
+        kogu_eesti = pick_kogu_eesti_code(res_values, res_texts)
+        if not kogu_eesti:
+            raise HTTPException(status_code=500, detail="Could not find 'Kogu Eesti' in RV0240.")
+        residence_filter = [kogu_eesti]
 
-    wanted_ages = [str(a) for a in range(a_from, a_to + 1)]
+    wanted_ages = get_requested_age_values(req)
     results: Dict[str, Any] = {}
 
     sex_values, _ = resolve_sex_values(sex_var, req.sex_filter)
@@ -449,7 +547,7 @@ async def quotas_from_rv0240_base_agegroup_and_sex(req: QuotaRequest) -> Dict[st
     age_labels_map = labels[age_var["code"]]
     age_idx_to_age = [parse_numeric_age(str(age_labels_map.get(k, k))) for k in age_keys]
 
-    buckets = make_buckets_first_to_24(a_from, a_to, int(req.age_grouping_years))
+    buckets = get_output_age_buckets(req)
     age_to_bucket = build_age_to_bucket_index(buckets)
 
     bucket_pops = [0] * len(buckets)
@@ -470,7 +568,9 @@ async def quotas_from_rv0240_base_agegroup_and_sex(req: QuotaRequest) -> Dict[st
             base=age_base,
             cells=age_cells,
             notes=[
-                "Bucketing: first bucket ends at age 24 unless chosen age grouping is 1 year",
+                "Bucketing: first bucket ends at age 24 unless chosen age grouping is 1 year"
+                if not req.custom_age_groups
+                else "Using custom age groups from the request.",
             ],
         ).model_dump()
 
@@ -516,8 +616,10 @@ async def quotas_from_rv0240_base_agegroup_and_sex(req: QuotaRequest) -> Dict[st
             "source": "RV0240",
             "year": req.reference.year,
             "age_band": {"from": a_from, "to": a_to},
+            "custom_age_groups": [{"from": start, "to": end} for start, end in age_spans] if req.custom_age_groups else [],
             "bucket_years": int(req.age_grouping_years),
             "sex_filter": req.sex_filter,
+            "county_filter": county_label,
         },
     }
 
@@ -531,9 +633,24 @@ async def quotas_rv0240_county(req: QuotaRequest) -> Dict[str, Any]:
     sex_var = pick_var(vars_, ["sugu", "sex"])
     code_to_text, res_code = rv0240_detect_residence_lists(vars_)
 
-    a_from, a_to = req.age_band.from_age, req.age_band.to_age
-    wanted_ages = [str(a) for a in range(a_from, a_to + 1)]
+    wanted_ages = get_requested_age_values(req)
     sex_values, _ = resolve_sex_values(sex_var, req.sex_filter)
+    county_code, county_label = resolve_rv0240_county_filter(vars_, req.county_filter)
+
+    if county_code:
+        js = await rv0240_fetch(req.reference.year, wanted_ages, sex_values, [county_code])
+        keys, labs, pops = rv0240_sum_by_dim(js, res_code)
+        pop = 0
+        for key, label, value in zip(keys, labs, pops):
+            if str(key) == county_code or fold(label) == fold(county_label or ""):
+                pop = int(value)
+                break
+        base, cells = compute_cells([county_code], [county_label.title() if county_label else req.county_filter or county_code], [pop], req.sample_n)
+        return {
+            "population_total": base,
+            "results": {"county": DimensionResult(base=base, cells=cells, notes=["County filter narrows county output to the selected county."]).model_dump()},
+            "meta": {"source": "RV0240", "sex_filter": req.sex_filter, "county_filter": county_label},
+        }
 
     county_codes = [
         c for c, t in code_to_text.items()
@@ -599,13 +716,17 @@ async def quotas_rv0240_county(req: QuotaRequest) -> Dict[str, Any]:
     }
 
 async def quotas_rv0240_region5(req: QuotaRequest) -> Dict[str, Any]:
+    if req.county_filter:
+        raise HTTPException(
+            status_code=400,
+            detail={"msg": "county_filter is not supported for region output, because RV0240 uses one residence dimension as either a filter or a region breakdown.", "county_filter": req.county_filter},
+        )
     meta = await px_meta("RV0240")
     vars_ = meta.get("variables", [])
     sex_var = pick_var(vars_, ["sugu", "sex"])
     code_to_text, res_code = rv0240_detect_residence_lists(vars_)
 
-    a_from, a_to = req.age_band.from_age, req.age_band.to_age
-    wanted_ages = [str(a) for a in range(a_from, a_to + 1)]
+    wanted_ages = get_requested_age_values(req)
     sex_values, _ = resolve_sex_values(sex_var, req.sex_filter)
 
     region_codes = [c for c, t in code_to_text.items() if is_region5_label(t)]
@@ -627,13 +748,17 @@ async def quotas_rv0240_region5(req: QuotaRequest) -> Dict[str, Any]:
     return {"population_total": base, "results": {"region": DimensionResult(base=base, cells=cells, notes=notes).model_dump()}, "meta": {"source": "RV0240", "sex_filter": req.sex_filter}}
 
 async def quotas_rv0240_tallinn_districts(req: QuotaRequest) -> Dict[str, Any]:
+    if req.county_filter:
+        raise HTTPException(
+            status_code=400,
+            detail={"msg": "county_filter is not supported for Tallinn district output, because RV0240 uses one residence dimension as either a filter or a district breakdown.", "county_filter": req.county_filter},
+        )
     meta = await px_meta("RV0240")
     vars_ = meta.get("variables", [])
     sex_var = pick_var(vars_, ["sugu", "sex"])
     code_to_text, res_code = rv0240_detect_residence_lists(vars_)
 
-    a_from, a_to = req.age_band.from_age, req.age_band.to_age
-    wanted_ages = [str(a) for a in range(a_from, a_to + 1)]
+    wanted_ages = get_requested_age_values(req)
     sex_values, _ = resolve_sex_values(sex_var, req.sex_filter)
 
     district_codes = [c for c, t in code_to_text.items() if is_tallinn_district_label(t)]
@@ -660,14 +785,18 @@ async def quotas_rv0240_tallinn_districts(req: QuotaRequest) -> Dict[str, Any]:
 # - Muu linn = (linnaline asustuspiirkond + väikelinnaline asustuspiirkond) - (Pealinn + Suurlinnad)
 # - Maa = maaline asustuspiirkond 
 async def quotas_rv0240_settlement_type4(req: QuotaRequest) -> Dict[str, Any]:
+    if req.county_filter:
+        raise HTTPException(
+            status_code=400,
+            detail={"msg": "county_filter is not supported for settlement type output, because RV0240 uses one residence dimension as either a filter or a settlement breakdown.", "county_filter": req.county_filter},
+        )
     meta = await px_meta("RV0240")
     vars_ = meta.get("variables", [])
     sex_var = pick_var(vars_, ["sugu", "sex"])
     res_var = pick_var(vars_, ["elukoht", "residence", "place of residence"])
     code_to_text, res_code = rv0240_detect_residence_lists(vars_)
 
-    a_from, a_to = req.age_band.from_age, req.age_band.to_age
-    wanted_ages = [str(a) for a in range(a_from, a_to + 1)]
+    wanted_ages = get_requested_age_values(req)
     sex_values, _ = resolve_sex_values(sex_var, req.sex_filter)
 
     res_values = res_var.get("values", []) or []
@@ -784,33 +913,36 @@ def parse_age_group_range(label: str) -> Optional[Tuple[int, int]]:
         return (a, a)
     return None
 
-def select_agegroups_overlap_with_notes(age_values: List[str], age_texts: List[str], req_from: int, req_to: int) -> Tuple[List[str], List[str]]:
+def select_agegroups_overlap_with_notes(age_values: List[str], age_texts: List[str], spans: List[Tuple[int, int]]) -> Tuple[List[str], List[str]]:
     parsed = [(str(c), str(t), parse_age_group_range(t)) for c, t in zip(age_values, age_texts)]
     chosen = []
     for code, txt, r in parsed:
         if r is None:
             continue
         a, b = r
-        if not (b < req_from or a > req_to):
+        if any(not (b < req_from or a > req_to) for req_from, req_to in spans):
             chosen.append((code, txt, a, b))
     if not chosen:
         avail = [t for _, t, r in parsed if r is not None]
-        raise HTTPException(status_code=400, detail={"msg": "No age groups overlap requested range.", "requested": {"from": req_from, "to": req_to}, "available_preview": avail[:60]})
+        raise HTTPException(status_code=400, detail={"msg": "No age groups overlap requested range.", "requested_spans": [{"from": x, "to": y} for x, y in spans], "available_preview": avail[:60]})
 
     used_from = min(a for _, _, a, _ in chosen)
     used_to = max(b for _, _, _, b in chosen)
     used_groups = [t for _, t, _, _ in chosen]
+    requested_label = requested_age_spans_label(spans)
 
     notes = [
         "⚠️ This quota uses AGE GROUPS (not single-year ages).",
-        f"Requested ages: {req_from}–{req_to}.",
+        f"Requested ages: {requested_label}.",
         f"Actually used (FULL overlapping age groups): {used_from}–{used_to}.",
         "Used age groups: " + ", ".join(used_groups),
     ]
-    if used_from < req_from:
-        notes.append(f"Includes younger ages too: {used_from}–{req_from-1}.")
-    if used_to > req_to:
-        notes.append(f"Includes older ages too: {req_to+1}–{used_to}.")
+    lowest_requested = min(start for start, _ in spans)
+    highest_requested = max(end for _, end in spans)
+    if used_from < lowest_requested:
+        notes.append(f"Includes younger ages too: {used_from}–{lowest_requested-1}.")
+    if used_to > highest_requested:
+        notes.append(f"Includes older ages too: {highest_requested+1}–{used_to}.")
     chosen_codes = {c for c, _, _, _ in chosen}
     codes_in_order = [c for c, _, _ in parsed if c in chosen_codes]
     return codes_in_order, notes
@@ -871,9 +1003,9 @@ async def quotas_nationality(req: QuotaRequest) -> Dict[str, Any]:
 
     age_values = ageg_var.get("values", []) or []
     age_texts = ageg_var.get("valueTexts", age_values) or []
-    age_codes, age_notes = select_agegroups_overlap_with_notes(age_values, age_texts, req.age_band.from_age, req.age_band.to_age)
+    age_codes, age_notes = select_agegroups_overlap_with_notes(age_values, age_texts, get_requested_age_spans(req))
 
-    geo_sel, geo_notes = make_geo_selection_total_or_eliminate(geo_var)
+    geo_sel, geo_notes = resolve_generic_county_selection(geo_var, req.county_filter)
 
     query = []
     for v in vars_:
@@ -960,9 +1092,9 @@ async def quotas_education(req: QuotaRequest) -> Dict[str, Any]:
 
     age_values = ageg_var.get("values", []) or []
     age_texts = ageg_var.get("valueTexts", age_values) or []
-    age_codes, age_notes = select_agegroups_overlap_with_notes(age_values, age_texts, req.age_band.from_age, req.age_band.to_age)
+    age_codes, age_notes = select_agegroups_overlap_with_notes(age_values, age_texts, get_requested_age_spans(req))
 
-    geo_sel, geo_notes = make_geo_selection_total_or_eliminate(geo_var)
+    geo_sel, geo_notes = resolve_generic_county_selection(geo_var, req.county_filter)
 
     edu_values = edu_var.get("values", []) or []
     wanted_edu = [str(v) for v in edu_values if str(v) in ALLOWED_EDUCATION_IDS]
@@ -1068,9 +1200,9 @@ async def quotas_rv069u_country_aggregated(req: QuotaRequest, mode: str) -> Dict
 
     age_values = ageg_var.get("values", []) or []
     age_texts = ageg_var.get("valueTexts", age_values) or []
-    age_codes, age_notes = select_agegroups_overlap_with_notes(age_values, age_texts, req.age_band.from_age, req.age_band.to_age)
+    age_codes, age_notes = select_agegroups_overlap_with_notes(age_values, age_texts, get_requested_age_spans(req))
 
-    geo_sel, geo_notes = make_geo_selection_total_or_eliminate(geo_var)
+    geo_sel, geo_notes = resolve_generic_county_selection(geo_var, req.county_filter)
 
     birth_code, citizen_code = pick_birthcit_type_codes(type_var)
     chosen_type_code = birth_code if mode == "birth" else citizen_code
@@ -1190,6 +1322,21 @@ async def handler(req, exc):
 @app.get("/health")
 async def health():
     return {"ok": True, "pxweb_base": PXWEB_BASE}
+
+@app.get("/v1/options/counties")
+async def county_options():
+    meta = await px_meta("RV0240")
+    vars_ = meta.get("variables", [])
+    code_to_text, _ = rv0240_detect_residence_lists(vars_)
+
+    items = []
+    for code, label in code_to_text.items():
+        clean = clean_value_text(label)
+        if is_county_label(clean):
+            items.append({"code": str(code), "label": clean.title()})
+
+    items.sort(key=lambda item: fold(item["label"]))
+    return {"items": items}
 
 @app.post("/v1/quotas/calculate", response_model=QuotaResponse)
 async def calculate(req: QuotaRequest, x_api_key: Optional[str] = Header(default=None)):
