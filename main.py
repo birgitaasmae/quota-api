@@ -1403,6 +1403,19 @@ async def calculate(req: QuotaRequest, x_api_key: Optional[str] = Header(default
             normalized.append(d)
     req.dimensions = normalized
 
+    chosen_nationality_filter = normalize_nationality_filter(req.nationality_filter)
+    if chosen_nationality_filter != "all":
+        unsupported = [d for d in req.dimensions if d != "nationality"]
+        if unsupported:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "msg": "nationality_filter is only possible with the Nationality dimension.",
+                    "nationality_filter": chosen_nationality_filter,
+                    "unsupported_dimensions": unsupported,
+                },
+            )
+
     base_pack = await quotas_from_rv0240_base_agegroup_and_sex(req)
     population_total = base_pack["population_total"]
 
