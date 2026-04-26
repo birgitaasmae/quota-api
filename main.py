@@ -449,6 +449,13 @@ def find_city_code_exact(code_to_text: Dict[str, str], city: str) -> Optional[st
             return str(c)
     return None
 
+def city_filter_aliases(city: str) -> List[str]:
+    if city == "Tallinn":
+        return ["Tallinn", "Tallinna linn", "Tallinn linn"]
+    if city == "Tartu":
+        return ["Tartu", "Tartu linn"]
+    return [city, f"{city} linn"]
+
 def find_res_code_contains(code_to_text: Dict[str, str], required_substrings: List[str]) -> Optional[str]:
     """
     Find a residence code whose cleaned label contains ALL required substrings (folded).
@@ -474,13 +481,22 @@ def resolve_rv0240_county_filter(meta_vars: List[Dict[str, Any]], county_filter:
     if not county_filter:
         return None, None
     code_to_text, _ = rv0240_detect_residence_lists(meta_vars)
+    for city in ["Tallinn", "Tartu"]:
+        city_code = find_city_code_exact(code_to_text, city)
+        if city_code and fold(county_filter) in {fold(alias) for alias in city_filter_aliases(city)}:
+            clean = clean_value_text(code_to_text[city_code])
+            if city == "Tallinn":
+                return city_code, "Tallinna linn"
+            if city == "Tartu":
+                return city_code, "Tartu linn"
+            return city_code, clean
     for code, label in code_to_text.items():
         clean = clean_value_text(label)
         if not is_county_label(clean):
             continue
         if fold(clean) == fold(county_filter) or fold(str(code)) == fold(county_filter):
             return str(code), clean
-    available = sorted(clean_value_text(t).title() for t in code_to_text.values() if is_county_label(clean_value_text(t)))
+    available = ["Tallinna linn", "Tartu linn"] + sorted(clean_value_text(t).title() for t in code_to_text.values() if is_county_label(clean_value_text(t)))
     raise HTTPException(
         status_code=400,
         detail={"msg": "Unknown county_filter for RV0240.", "county_filter": county_filter, "available_counties": available},
@@ -1381,6 +1397,12 @@ async def county_options():
     code_to_text, _ = rv0240_detect_residence_lists(vars_)
 
     items = []
+    tallinn_code = find_city_code_exact(code_to_text, "Tallinn")
+    tartu_code = find_city_code_exact(code_to_text, "Tartu")
+    if tallinn_code:
+        items.append({"code": str(tallinn_code), "label": "Tallinna linn"})
+    if tartu_code:
+        items.append({"code": str(tartu_code), "label": "Tartu linn"})
     for code, label in code_to_text.items():
         clean = clean_value_text(label)
         if is_county_label(clean):
