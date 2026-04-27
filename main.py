@@ -411,15 +411,17 @@ def rv0240_detect_residence_lists(meta_vars: List[Dict[str, Any]]) -> Tuple[Dict
     return code_to_text, res_code
 
 def is_county_label(label: str) -> bool:
-    if "." in label:
+    clean = clean_value_text(label)
+    folded = fold(clean)
+    if "." in clean:
         return False
-    if ":" in label:
+    if ":" in clean:
         return False
-    if "asustuspiirkond" in fold(label):
+    if "asustuspiirkond" in folded:
         return False
-    if fold(label) in ["maakond teadmata", "teadmata"]:
+    if folded in ["maakond teadmata", "elukoht teadmata", "teadmata"]:
         return False
-    return bool(re.match(r"^[A-ZÄÖÜÕ\- ]+ MAAKOND$", label.strip()))
+    return folded.endswith(" maakond")
 
 def is_tallinn_district_label(label: str) -> bool:
     t = fold(label)
