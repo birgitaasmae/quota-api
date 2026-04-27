@@ -464,6 +464,27 @@ def find_city_value_in_values(values: List[str], value_texts: List[str], city: s
             return str(code), label
     return None
 
+def is_city_county_filter(value: Optional[str]) -> bool:
+    if not value:
+        return False
+    return fold(value) in {fold(alias) for alias in (city_filter_aliases("Tallinn") + city_filter_aliases("Tartu"))}
+
+def find_county_settlement_codes(code_to_text: Dict[str, str], county_label: str) -> Dict[str, str]:
+    target = fold(clean_value_text(county_label))
+    found: Dict[str, str] = {}
+    for code, raw_label in code_to_text.items():
+        label = clean_value_text(raw_label)
+        folded = fold(label)
+        if not folded.startswith(target):
+            continue
+        if "vaikelinnaline asustuspiirkond" in folded or "väikelinnaline asustuspiirkond" in folded:
+            found["small_urban"] = str(code)
+        elif "linnaline asustuspiirkond" in folded:
+            found["urban"] = str(code)
+        elif "maaline asustuspiirkond" in folded:
+            found["rural"] = str(code)
+    return found
+
 def find_res_code_contains(code_to_text: Dict[str, str], required_substrings: List[str]) -> Optional[str]:
     """
     Find a residence code whose cleaned label contains ALL required substrings (folded).
@@ -819,11 +840,6 @@ async def quotas_rv0240_tallinn_districts(req: QuotaRequest) -> Dict[str, Any]:
 # - Muu linn = (linnaline asustuspiirkond + väikelinnaline asustuspiirkond) - (Pealinn + Suurlinnad)
 # - Maa = maaline asustuspiirkond 
 async def quotas_rv0240_settlement_type4(req: QuotaRequest) -> Dict[str, Any]:
-    if req.county_filter:
-        raise HTTPException(
-            status_code=400,
-            detail={"msg": "county_filter is not supported for settlement type output, because RV0240 uses one residence dimension as either a filter or a settlement breakdown.", "county_filter": req.county_filter},
-        )
     meta = await px_meta("RV0240")
     vars_ = meta.get("variables", [])
     sex_var = pick_var(vars_, ["sugu", "sex"])
@@ -838,6 +854,53 @@ async def quotas_rv0240_settlement_type4(req: QuotaRequest) -> Dict[str, Any]:
     kogu_eesti_code = pick_kogu_eesti_code(res_values, res_texts)
     if not kogu_eesti_code:
         raise HTTPException(status_code=500, detail="Could not find 'Kogu Eesti' in RV0240.")
+
+    if req.county_filter:
+        if is_city_county_filter(req.county_filter):
+            raise HTTPException(
+                status_code=400,
+                detail={"msg": "county_filter is not supported for settlement type output for city filters, because RV0240 does not provide a city-level linnaline/väikelinnaline/maaline triplet for this selection.", "county_filter": req.county_filter},
+            )
+
+        county_code, county_label = resolve_rv0240_county_filter(vars_, req.county_filter)
+        if not county_code or not county_label:
+            raise HTTPException(status_code=400, detail={"msg": "Unknown county_filter for settlement type output.", "county_filter": req.county_filter})
+
+        settlement_codes = find_county_settlement_codes(code_to_text, county_label)
+        if set(settlement_codes.keys()) != {"urban", "small_urban", "rural"}:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "msg": "Could not find full county settlement type split in RV0240.",
+                    "county_filter": req.county_filter,
+                    "found": settlement_codes,
+                },
+            )
+
+        needed_codes = list(settlement_codes.values())
+        js = await rv0240_fetch(req.reference.year, wanted_ages, sex_values, needed_codes)
+        keys, labs, pops = rv0240_sum_by_dim(js, res_code)
+        pop_by_code = {k: int(p) for k, p in zip(keys, pops)}
+
+        out_ids = ["urban", "small_urban", "rural"]
+        out_labs = [
+            f"{county_label.title()}: linnaline asustuspiirkond",
+            f"{county_label.title()}: vaikelinnaline asustuspiirkond",
+            f"{county_label.title()}: maaline asustuspiirkond",
+        ]
+        out_pops = [
+            pop_by_code.get(settlement_codes["urban"], 0),
+            pop_by_code.get(settlement_codes["small_urban"], 0),
+            pop_by_code.get(settlement_codes["rural"], 0),
+        ]
+
+        notes = [f"Settlement type split for {county_label.title()} from RV0240 county-level settlement rows."]
+        base, cells = compute_cells(out_ids, out_labs, out_pops, req.sample_n)
+        return {
+            "population_total": base,
+            "results": {"settlement_type": DimensionResult(base=base, cells=cells, notes=notes).model_dump()},
+            "meta": {"source": "RV0240", "sex_filter": req.sex_filter, "county_filter": county_label},
+        }
 
     # Exact city codes
     tallinn_code = find_city_code_exact(code_to_text, "Tallinn")
