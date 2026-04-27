@@ -1193,6 +1193,14 @@ def choose_grouped_table_county_values(var: Dict[str, Any]) -> List[str]:
         raise HTTPException(status_code=500, detail={"msg": "No supported county values found for grouped table."})
     return chosen
 
+def choose_grouped_table_tallinn_district_values(var: Dict[str, Any]) -> List[str]:
+    values = var.get("values", []) or []
+    texts = var.get("valueTexts", values) or []
+    chosen = [str(code) for code, txt in zip(values, texts) if is_tallinn_district_label(clean_value_text(txt))]
+    if not chosen:
+        raise HTTPException(status_code=400, detail={"msg": "Tallinn district output is not available in this table."})
+    return chosen
+
 def nationality_group_for_label(label: str) -> Optional[str]:
     t = fold(label)
     if is_totalish(label) or "rahvus kokku" in t or "rahvused kokku" in t:
@@ -1228,7 +1236,20 @@ async def quotas_from_nationality_table_filtered(req: QuotaRequest) -> Dict[str,
     age_codes, age_notes = select_agegroups_overlap_with_notes(age_values, age_texts, get_requested_age_spans(req))
 
     geo_notes: List[str] = []
-    if req.county_filter:
+    district_mode = False
+    if "tallinn_districts" in req.dimensions:
+        if req.county_filter and fold(req.county_filter) not in {fold(alias) for alias in city_filter_aliases("Tallinn")}:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "msg": "Tallinn Districts with nationality_filter is only possible when county_filter is Tallinna linn.",
+                    "county_filter": req.county_filter,
+                },
+            )
+        geo_sel = {"filter": "item", "values": choose_grouped_table_tallinn_district_values(geo_var)}
+        geo_notes.append("Tallinn Districts output uses RV022U district rows.")
+        district_mode = True
+    elif req.county_filter:
         geo_sel, geo_notes = resolve_generic_county_selection(geo_var, req.county_filter)
     elif "county" in req.dimensions:
         geo_sel = {"filter": "item", "values": choose_grouped_table_county_values(geo_var)}
@@ -1325,18 +1346,39 @@ async def quotas_from_nationality_table_filtered(req: QuotaRequest) -> Dict[str,
         results["age_group"] = build_result(out_ids, out_labels, out_pops).model_dump()
 
     if "county" in req.dimensions:
+        if district_mode:
+            total = sum(value for _, value in included_rows)
+            out_ids = ["Tallinna linn"]
+            out_labels = ["Tallinna linn"]
+            out_pops = [int(total)]
+            county_notes = ["County output is aggregated from Tallinn district rows in RV022U."]
+            results["county"] = build_result(out_ids, out_labels, out_pops, county_notes).model_dump()
+        else:
+            pop_by_label: Dict[str, int] = {}
+            for coords, value in included_rows:
+                raw_label = clean_value_text(g_label_map.get(g_keys[coords[g_pos]], g_keys[coords[g_pos]]))
+                if not is_supported_county_output_label(raw_label):
+                    continue
+                out_label = county_output_label(raw_label)
+                pop_by_label[out_label] = pop_by_label.get(out_label, 0) + value
+            out_labels = list(pop_by_label.keys())
+            out_ids = out_labels[:]
+            out_pops = [int(pop_by_label[label]) for label in out_labels]
+            county_notes = ["County output follows the grouped nationality table geography values."]
+            results["county"] = build_result(out_ids, out_labels, out_pops, county_notes).model_dump()
+
+    if "tallinn_districts" in req.dimensions:
         pop_by_label: Dict[str, int] = {}
         for coords, value in included_rows:
             raw_label = clean_value_text(g_label_map.get(g_keys[coords[g_pos]], g_keys[coords[g_pos]]))
-            if not is_supported_county_output_label(raw_label):
+            if not is_tallinn_district_label(raw_label):
                 continue
-            out_label = county_output_label(raw_label)
-            pop_by_label[out_label] = pop_by_label.get(out_label, 0) + value
+            pop_by_label[raw_label] = pop_by_label.get(raw_label, 0) + value
         out_labels = list(pop_by_label.keys())
         out_ids = out_labels[:]
         out_pops = [int(pop_by_label[label]) for label in out_labels]
-        county_notes = ["County output follows the grouped nationality table geography values."]
-        results["county"] = build_result(out_ids, out_labels, out_pops, county_notes).model_dump()
+        district_notes = ["Tallinn Districts output comes from RV022U district rows."]
+        results["tallinn_districts"] = build_result(out_ids, out_labels, out_pops, district_notes).model_dump()
 
     if "nationality" in req.dimensions:
         grouped = {
@@ -1946,13 +1988,13 @@ async def calculate(req: QuotaRequest, x_api_key: Optional[str] = Header(default
             },
         )
     if chosen_nationality_filter != "all":
-        allowed = {"sex", "age_group", "county", "nationality"}
+        allowed = {"sex", "age_group", "county", "nationality", "tallinn_districts"}
         unsupported = [d for d in req.dimensions if d not in allowed]
         if unsupported:
             raise HTTPException(
                 status_code=400,
                 detail={
-                    "msg": "nationality_filter is only possible with Sex, Age Group, County, and Nationality dimensions.",
+                    "msg": "nationality_filter is only possible with Sex, Age Group, County, Nationality, and Tallinn Districts dimensions.",
                     "nationality_filter": chosen_nationality_filter,
                     "unsupported_dimensions": unsupported,
                 },
