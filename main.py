@@ -1141,6 +1141,384 @@ def normalize_education_filter(value: Optional[str]) -> str:
         )
     return mapping[f]
 
+def resolve_grouped_table_sex_values(sex_var: Dict[str, Any], sex_filter: Optional[str]) -> Tuple[List[str], List[str]]:
+    total_code = choose_total_sex_code(sex_var)
+    men_code, women_code = choose_men_women_codes(sex_var)
+    f = fold(sex_filter or "total")
+
+    if f in {"men", "mehed", "m", "male"}:
+        return [men_code], [men_code]
+    if f in {"women", "naised", "f", "female"}:
+        return [women_code], [women_code]
+    if f in {"total", "all", "both", "kokku", "mehed ja naised", "mehedjanaised"}:
+        return [men_code, women_code], [men_code, women_code]
+
+    raise HTTPException(status_code=400, detail={"msg": "Invalid sex_filter. Use: total | men | women", "sex_filter": sex_filter})
+
+def is_supported_county_output_label(label: str) -> bool:
+    clean = clean_value_text(label)
+    if is_county_label(clean):
+        return True
+    aliases = set()
+    for city in ["Tallinn", "Tartu"]:
+        aliases.update(fold(alias) for alias in city_filter_aliases(city))
+    return fold(clean) in aliases
+
+def county_output_label(label: str) -> str:
+    clean = clean_value_text(label)
+    folded = fold(clean)
+    if folded in {fold(alias) for alias in city_filter_aliases("Tallinn")}:
+        return "Tallinna linn"
+    if folded in {fold(alias) for alias in city_filter_aliases("Tartu")}:
+        return "Tartu linn"
+    return clean.title()
+
+def choose_grouped_table_county_values(var: Dict[str, Any]) -> List[str]:
+    values = var.get("values", []) or []
+    texts = var.get("valueTexts", values) or []
+    chosen: List[str] = []
+    seen_labels = set()
+    for code, txt in zip(values, texts):
+        label = clean_value_text(txt)
+        if not is_supported_county_output_label(label):
+            continue
+        out_label = county_output_label(label)
+        if out_label in seen_labels:
+            continue
+        seen_labels.add(out_label)
+        chosen.append(str(code))
+    if not chosen:
+        raise HTTPException(status_code=500, detail={"msg": "No supported county values found for grouped table."})
+    return chosen
+
+def nationality_group_for_label(label: str) -> Optional[str]:
+    t = fold(label)
+    if is_totalish(label) or "rahvus kokku" in t or "rahvused kokku" in t:
+        return None
+    if "teadmata" in t:
+        return None
+    if "eestl" in t:
+        return "estonian"
+    if "venel" in t:
+        return "russian"
+    if "ukrain" in t:
+        return "ukrainian"
+    return "other"
+
+async def quotas_from_nationality_table_filtered(req: QuotaRequest) -> Dict[str, Any]:
+    table = "RV022U"
+    meta = await px_meta(table)
+    vars_ = meta.get("variables", [])
+
+    year_var = pick_var(vars_, ["aasta", "year"])
+    sex_var = pick_var(vars_, ["sugu", "sex"])
+    ageg_var = pick_var(vars_, ["vanuserühm", "vanuseruhm", "vanusrühm", "vanusr", "age group", "agegroup"])
+    nat_var = pick_var(vars_, ["rahvus", "nationality"])
+    geo_var = pick_var(vars_, ["maakond", "county"])
+
+    years = year_var.get("values", [])
+    if str(req.reference.year) not in years:
+        raise HTTPException(status_code=400, detail={"msg": f"Year {req.reference.year} not available in {table}", "available_years": years})
+
+    query_sex_values, sex_output_values = resolve_grouped_table_sex_values(sex_var, req.sex_filter)
+    age_values = ageg_var.get("values", []) or []
+    age_texts = ageg_var.get("valueTexts", age_values) or []
+    age_codes, age_notes = select_agegroups_overlap_with_notes(age_values, age_texts, get_requested_age_spans(req))
+
+    geo_notes: List[str] = []
+    if req.county_filter:
+        geo_sel, geo_notes = resolve_generic_county_selection(geo_var, req.county_filter)
+    elif "county" in req.dimensions:
+        geo_sel = {"filter": "item", "values": choose_grouped_table_county_values(geo_var)}
+    else:
+        geo_sel, geo_notes = make_geo_selection_total_or_eliminate(geo_var)
+
+    query = []
+    for v in vars_:
+        code = v["code"]
+        if code == year_var["code"]:
+            query.append({"code": code, "selection": {"filter": "item", "values": [str(req.reference.year)]}})
+        elif code == sex_var["code"]:
+            query.append({"code": code, "selection": {"filter": "item", "values": query_sex_values}})
+        elif code == ageg_var["code"]:
+            query.append({"code": code, "selection": {"filter": "item", "values": age_codes}})
+        elif code == geo_var["code"]:
+            if geo_sel is None:
+                continue
+            query.append({"code": code, "selection": geo_sel})
+        else:
+            query.append({"code": code, "selection": {"filter": "all", "values": ["*"]}})
+
+    js = await px_query(table, query)
+    ids, inv, labels, rows = parse_jsonstat(js)
+
+    n_pos = ids.index(nat_var["code"])
+    s_pos = ids.index(sex_var["code"])
+    a_pos = ids.index(ageg_var["code"])
+    g_pos = ids.index(geo_var["code"])
+
+    n_keys = inv[nat_var["code"]]
+    s_keys = inv[sex_var["code"]]
+    a_keys = inv[ageg_var["code"]]
+    g_keys = inv[geo_var["code"]]
+
+    n_label_map = labels[nat_var["code"]]
+    s_label_map = labels[sex_var["code"]]
+    a_label_map = labels[ageg_var["code"]]
+    g_label_map = labels[geo_var["code"]]
+
+    chosen_filter = normalize_nationality_filter(req.nationality_filter)
+    included_rows: List[Tuple[List[int], int]] = []
+    teadmata_skipped = 0
+    for coords, value in rows:
+        nat_key = n_keys[coords[n_pos]]
+        nat_label = str(n_label_map.get(nat_key, nat_key))
+        nat_group = nationality_group_for_label(nat_label)
+        if nat_group is None:
+            if "teadmata" in fold(nat_label):
+                teadmata_skipped += int(value)
+            continue
+        if chosen_filter != "all" and nat_group != chosen_filter:
+            continue
+        included_rows.append((coords, int(value)))
+
+    notes: List[str] = []
+    notes.extend(age_notes)
+    notes.extend(geo_notes)
+    if chosen_filter != "all":
+        notes.append(f"Nationality filter applied: {chosen_filter}.")
+    notes.append("Unknown Nationality is excluded.")
+    if teadmata_skipped:
+        notes.append(f"Skipped teadmata pop: {teadmata_skipped}")
+
+    def build_result(ids_out: List[str], labels_out: List[str], pops_out: List[int], extra_notes: Optional[List[str]] = None) -> DimensionResult:
+        base, cells = compute_cells(ids_out, labels_out, pops_out, req.sample_n)
+        merged_notes = list(notes)
+        if extra_notes:
+            merged_notes.extend(extra_notes)
+        return DimensionResult(base=base, cells=cells, notes=merged_notes)
+
+    results: Dict[str, Any] = {}
+
+    if "sex" in req.dimensions:
+        pop_by_key = {key: 0 for key in sex_output_values}
+        for coords, value in included_rows:
+            key = s_keys[coords[s_pos]]
+            if key in pop_by_key:
+                pop_by_key[key] += value
+        out_ids = list(sex_output_values)
+        out_labels = [clean_value_text(s_label_map.get(key, key)) for key in out_ids]
+        out_pops = [int(pop_by_key.get(key, 0)) for key in out_ids]
+        results["sex"] = build_result(out_ids, out_labels, out_pops).model_dump()
+
+    if "age_group" in req.dimensions:
+        pop_by_key = {key: 0 for key in a_keys if key in age_codes}
+        for coords, value in included_rows:
+            key = a_keys[coords[a_pos]]
+            if key in pop_by_key:
+                pop_by_key[key] += value
+        out_ids = [key for key in a_keys if key in pop_by_key]
+        out_labels = [clean_value_text(a_label_map.get(key, key)) for key in out_ids]
+        out_pops = [int(pop_by_key.get(key, 0)) for key in out_ids]
+        results["age_group"] = build_result(out_ids, out_labels, out_pops).model_dump()
+
+    if "county" in req.dimensions:
+        pop_by_label: Dict[str, int] = {}
+        for coords, value in included_rows:
+            raw_label = clean_value_text(g_label_map.get(g_keys[coords[g_pos]], g_keys[coords[g_pos]]))
+            if not is_supported_county_output_label(raw_label):
+                continue
+            out_label = county_output_label(raw_label)
+            pop_by_label[out_label] = pop_by_label.get(out_label, 0) + value
+        out_labels = list(pop_by_label.keys())
+        out_ids = out_labels[:]
+        out_pops = [int(pop_by_label[label]) for label in out_labels]
+        county_notes = ["County output follows the grouped nationality table geography values."]
+        results["county"] = build_result(out_ids, out_labels, out_pops, county_notes).model_dump()
+
+    if "nationality" in req.dimensions:
+        grouped = {
+            "estonian": 0,
+            "russian": 0,
+            "ukrainian": 0,
+            "other": 0,
+        }
+        for coords, value in included_rows:
+            nat_key = n_keys[coords[n_pos]]
+            nat_label = str(n_label_map.get(nat_key, nat_key))
+            nat_group = nationality_group_for_label(nat_label)
+            if nat_group:
+                grouped[nat_group] += value
+        ordered = [
+            ("estonian", "Eestlased"),
+            ("russian", "Venelased"),
+            ("ukrainian", "Ukrainlased"),
+            ("other", "Muud rahvused"),
+        ]
+        selected = ordered if chosen_filter == "all" else [item for item in ordered if item[0] == chosen_filter]
+        out_ids = [item[0] for item in selected]
+        out_labels = [item[1] for item in selected]
+        out_pops = [int(grouped[item[0]]) for item in selected]
+        results["nationality"] = build_result(out_ids, out_labels, out_pops).model_dump()
+
+    population_total = sum(value for _, value in included_rows)
+    return {
+        "population_total": population_total,
+        "results": results,
+        "meta": {"source": table, "sex_filter": req.sex_filter, "county_filter": req.county_filter, "nationality_filter": chosen_filter},
+    }
+
+async def quotas_from_education_table_filtered(req: QuotaRequest) -> Dict[str, Any]:
+    table = "RV0231U"
+    meta = await px_meta(table)
+    vars_ = meta.get("variables", [])
+
+    year_var = pick_var(vars_, ["aasta", "year"])
+    sex_var = pick_var(vars_, ["sugu", "sex"])
+    ageg_var = pick_var(vars_, ["vanuserühm", "vanuseruhm", "vanusrühm", "vanusr", "age group", "agegroup"])
+    edu_var = pick_var(vars_, ["haridus", "education"])
+    geo_var = pick_var(vars_, ["maakond", "county"])
+
+    years = year_var.get("values", [])
+    if str(req.reference.year) not in years:
+        raise HTTPException(status_code=400, detail={"msg": f"Year {req.reference.year} not available in {table}", "available_years": years})
+
+    query_sex_values, sex_output_values = resolve_grouped_table_sex_values(sex_var, req.sex_filter)
+    age_values = ageg_var.get("values", []) or []
+    age_texts = ageg_var.get("valueTexts", age_values) or []
+    age_codes, age_notes = select_agegroups_overlap_with_notes(age_values, age_texts, get_requested_age_spans(req))
+
+    geo_notes: List[str] = []
+    if req.county_filter:
+        geo_sel, geo_notes = resolve_generic_county_selection(geo_var, req.county_filter)
+    elif "county" in req.dimensions:
+        geo_sel = {"filter": "item", "values": choose_grouped_table_county_values(geo_var)}
+    else:
+        geo_sel, geo_notes = make_geo_selection_total_or_eliminate(geo_var)
+
+    edu_values = edu_var.get("values", []) or []
+    chosen_education_filter = normalize_education_filter(req.education_filter)
+    wanted_edu = [str(v) for v in edu_values if str(v) in ALLOWED_EDUCATION_IDS]
+    if not wanted_edu:
+        raise HTTPException(status_code=500, detail={"msg": "None of education IDs 2,7,11 found in table.", "table": table})
+    if chosen_education_filter != "all":
+        if chosen_education_filter not in wanted_edu:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "msg": "Requested education_filter is not available in RV0231U.",
+                    "education_filter": chosen_education_filter,
+                    "available_filters": sorted(wanted_edu),
+                },
+            )
+        wanted_edu = [chosen_education_filter]
+
+    query = []
+    for v in vars_:
+        code = v["code"]
+        if code == year_var["code"]:
+            query.append({"code": code, "selection": {"filter": "item", "values": [str(req.reference.year)]}})
+        elif code == sex_var["code"]:
+            query.append({"code": code, "selection": {"filter": "item", "values": query_sex_values}})
+        elif code == ageg_var["code"]:
+            query.append({"code": code, "selection": {"filter": "item", "values": age_codes}})
+        elif code == geo_var["code"]:
+            if geo_sel is None:
+                continue
+            query.append({"code": code, "selection": geo_sel})
+        elif code == edu_var["code"]:
+            query.append({"code": code, "selection": {"filter": "item", "values": wanted_edu}})
+        else:
+            query.append({"code": code, "selection": {"filter": "all", "values": ["*"]}})
+
+    js = await px_query(table, query)
+    ids, inv, labels, rows = parse_jsonstat(js)
+
+    e_pos = ids.index(edu_var["code"])
+    s_pos = ids.index(sex_var["code"])
+    a_pos = ids.index(ageg_var["code"])
+    g_pos = ids.index(geo_var["code"])
+
+    e_keys = inv[edu_var["code"]]
+    s_keys = inv[sex_var["code"]]
+    a_keys = inv[ageg_var["code"]]
+    g_keys = inv[geo_var["code"]]
+
+    e_label_map = labels[edu_var["code"]]
+    s_label_map = labels[sex_var["code"]]
+    a_label_map = labels[ageg_var["code"]]
+    g_label_map = labels[geo_var["code"]]
+
+    notes: List[str] = []
+    notes.extend(age_notes)
+    notes.extend(geo_notes)
+    if chosen_education_filter != "all":
+        notes.append(f"Education filter applied: {chosen_education_filter}.")
+    notes.append("Education Unknown is excluded.")
+
+    def build_result(ids_out: List[str], labels_out: List[str], pops_out: List[int], extra_notes: Optional[List[str]] = None) -> DimensionResult:
+        base, cells = compute_cells(ids_out, labels_out, pops_out, req.sample_n)
+        merged_notes = list(notes)
+        if extra_notes:
+            merged_notes.extend(extra_notes)
+        return DimensionResult(base=base, cells=cells, notes=merged_notes)
+
+    results: Dict[str, Any] = {}
+
+    if "sex" in req.dimensions:
+        pop_by_key = {key: 0 for key in sex_output_values}
+        for coords, value in rows:
+            key = s_keys[coords[s_pos]]
+            if key in pop_by_key:
+                pop_by_key[key] += int(value)
+        out_ids = list(sex_output_values)
+        out_labels = [clean_value_text(s_label_map.get(key, key)) for key in out_ids]
+        out_pops = [int(pop_by_key.get(key, 0)) for key in out_ids]
+        results["sex"] = build_result(out_ids, out_labels, out_pops).model_dump()
+
+    if "age_group" in req.dimensions:
+        pop_by_key = {key: 0 for key in a_keys if key in age_codes}
+        for coords, value in rows:
+            key = a_keys[coords[a_pos]]
+            if key in pop_by_key:
+                pop_by_key[key] += int(value)
+        out_ids = [key for key in a_keys if key in pop_by_key]
+        out_labels = [clean_value_text(a_label_map.get(key, key)) for key in out_ids]
+        out_pops = [int(pop_by_key.get(key, 0)) for key in out_ids]
+        results["age_group"] = build_result(out_ids, out_labels, out_pops).model_dump()
+
+    if "county" in req.dimensions:
+        pop_by_label: Dict[str, int] = {}
+        for coords, value in rows:
+            raw_label = clean_value_text(g_label_map.get(g_keys[coords[g_pos]], g_keys[coords[g_pos]]))
+            if not is_supported_county_output_label(raw_label):
+                continue
+            out_label = county_output_label(raw_label)
+            pop_by_label[out_label] = pop_by_label.get(out_label, 0) + int(value)
+        out_labels = list(pop_by_label.keys())
+        out_ids = out_labels[:]
+        out_pops = [int(pop_by_label[label]) for label in out_labels]
+        county_notes = ["County output follows the grouped education table geography values."]
+        results["county"] = build_result(out_ids, out_labels, out_pops, county_notes).model_dump()
+
+    if "education" in req.dimensions:
+        pop_by_key = {key: 0 for key in e_keys if key in wanted_edu}
+        for coords, value in rows:
+            key = e_keys[coords[e_pos]]
+            if key in pop_by_key:
+                pop_by_key[key] += int(value)
+        out_ids = [key for key in e_keys if key in pop_by_key]
+        out_labels = [clean_value_text(e_label_map.get(key, key)) for key in out_ids]
+        out_pops = [int(pop_by_key.get(key, 0)) for key in out_ids]
+        results["education"] = build_result(out_ids, out_labels, out_pops).model_dump()
+
+    population_total = sum(int(value) for _, value in rows)
+    return {
+        "population_total": population_total,
+        "results": results,
+        "meta": {"source": table, "sex_filter": req.sex_filter, "county_filter": req.county_filter, "education_filter": chosen_education_filter},
+    }
+
 
 # ================= RV022U nationality =================
 
@@ -1566,27 +1944,37 @@ async def calculate(req: QuotaRequest, x_api_key: Optional[str] = Header(default
             },
         )
     if chosen_nationality_filter != "all":
-        unsupported = [d for d in req.dimensions if d != "nationality"]
+        allowed = {"sex", "age_group", "county", "nationality"}
+        unsupported = [d for d in req.dimensions if d not in allowed]
         if unsupported:
             raise HTTPException(
                 status_code=400,
                 detail={
-                    "msg": "nationality_filter is only possible with the Nationality dimension.",
+                    "msg": "nationality_filter is only possible with Sex, Age Group, County, and Nationality dimensions.",
                     "nationality_filter": chosen_nationality_filter,
                     "unsupported_dimensions": unsupported,
                 },
             )
     if chosen_education_filter != "all":
-        unsupported = [d for d in req.dimensions if d != "education"]
+        allowed = {"sex", "age_group", "county", "education"}
+        unsupported = [d for d in req.dimensions if d not in allowed]
         if unsupported:
             raise HTTPException(
                 status_code=400,
                 detail={
-                    "msg": "education_filter is only possible with the Education dimension.",
+                    "msg": "education_filter is only possible with Sex, Age Group, County, and Education dimensions.",
                     "education_filter": chosen_education_filter,
                     "unsupported_dimensions": unsupported,
                 },
             )
+
+    if chosen_nationality_filter != "all":
+        pack = await quotas_from_nationality_table_filtered(req)
+        return {"population_total": pack["population_total"], "sample_n": req.sample_n, "results": pack["results"], "meta": {"base": pack["meta"], "sources": [pack["meta"]], "errors": {}}}
+
+    if chosen_education_filter != "all":
+        pack = await quotas_from_education_table_filtered(req)
+        return {"population_total": pack["population_total"], "sample_n": req.sample_n, "results": pack["results"], "meta": {"base": pack["meta"], "sources": [pack["meta"]], "errors": {}}}
 
     base_pack = await quotas_from_rv0240_base_agegroup_and_sex(req)
     population_total = base_pack["population_total"]
