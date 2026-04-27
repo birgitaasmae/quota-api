@@ -456,6 +456,14 @@ def city_filter_aliases(city: str) -> List[str]:
         return ["Tartu", "Tartu linn"]
     return [city, f"{city} linn"]
 
+def find_city_value_in_values(values: List[str], value_texts: List[str], city: str) -> Optional[Tuple[str, str]]:
+    aliases = {fold(alias) for alias in city_filter_aliases(city)}
+    for code, txt in zip(values, value_texts):
+        label = clean_value_text(txt)
+        if fold(label) in aliases or fold(str(code)) in aliases:
+            return str(code), label
+    return None
+
 def find_res_code_contains(code_to_text: Dict[str, str], required_substrings: List[str]) -> Optional[str]:
     """
     Find a residence code whose cleaned label contains ALL required substrings (folded).
@@ -507,6 +515,12 @@ def resolve_generic_county_selection(var: Dict[str, Any], county_filter: Optiona
     if county_filter:
         values = var.get("values", []) or []
         texts = var.get("valueTexts", values) or []
+        for city in ["Tallinn", "Tartu"]:
+            found_city = find_city_value_in_values(values, texts, city)
+            if found_city and fold(county_filter) in {fold(alias) for alias in city_filter_aliases(city)}:
+                code, label = found_city
+                notes.append(f"County filter: {label}.")
+                return {"filter": "item", "values": [code]}, notes
         found = find_value_code_exact(values, texts, county_filter)
         if not found:
             available = sorted(clean_value_text(t) for t in texts)
@@ -768,7 +782,7 @@ async def quotas_rv0240_region5(req: QuotaRequest) -> Dict[str, Any]:
     return {"population_total": base, "results": {"region": DimensionResult(base=base, cells=cells, notes=notes).model_dump()}, "meta": {"source": "RV0240", "sex_filter": req.sex_filter}}
 
 async def quotas_rv0240_tallinn_districts(req: QuotaRequest) -> Dict[str, Any]:
-    if req.county_filter:
+    if req.county_filter and fold(req.county_filter) not in {fold(alias) for alias in city_filter_aliases("Tallinn")}:
         raise HTTPException(
             status_code=400,
             detail={"msg": "county_filter is not supported for Tallinn district output, because RV0240 uses one residence dimension as either a filter or a district breakdown.", "county_filter": req.county_filter},
@@ -1122,7 +1136,7 @@ async def quotas_nationality(req: QuotaRequest) -> Dict[str, Any]:
     out_labels = [item[1] for item in selected]
     out_pops = [item[2] for item in selected]
 
-    notes = []
+    notes = ["Tallinn districts are available when county filter is Tallinn."] if req.county_filter else []
     notes.extend(age_notes)
     notes.extend(geo_notes)
     if chosen_filter != "all":
