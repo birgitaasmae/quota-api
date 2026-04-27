@@ -43,6 +43,10 @@ class QuotaRequest(BaseModel):
         default="all",
         description="Nationality filter for supported nationality calculations: all | estonian | russian | ukrainian | other.",
     )
+    education_filter: str = Field(
+        default="all",
+        description="Education filter for supported education calculations: all | basic | secondary | higher.",
+    )
 
     sex_filter: str = Field(
         default="total",
@@ -1107,6 +1111,36 @@ def normalize_nationality_filter(value: Optional[str]) -> str:
         )
     return mapping[f]
 
+def normalize_education_filter(value: Optional[str]) -> str:
+    f = fold(value or "all")
+    mapping = {
+        "all": "all",
+        "total": "all",
+        "2": "2",
+        "basic": "2",
+        "lower": "2",
+        "primary": "2",
+        "pohiharidus": "2",
+        "põhiharidus": "2",
+        "7": "7",
+        "secondary": "7",
+        "medium": "7",
+        "kutse": "7",
+        "keskharidus": "7",
+        "11": "11",
+        "higher": "11",
+        "high": "11",
+        "university": "11",
+        "korgharidus": "11",
+        "kõrgharidus": "11",
+    }
+    if f not in mapping:
+        raise HTTPException(
+            status_code=400,
+            detail={"msg": "Invalid education_filter. Use: all | basic | secondary | higher", "education_filter": value},
+        )
+    return mapping[f]
+
 
 # ================= RV022U nationality =================
 
@@ -1241,9 +1275,21 @@ async def quotas_education(req: QuotaRequest) -> Dict[str, Any]:
     geo_sel, geo_notes = resolve_generic_county_selection(geo_var, req.county_filter)
 
     edu_values = edu_var.get("values", []) or []
+    chosen_education_filter = normalize_education_filter(req.education_filter)
     wanted_edu = [str(v) for v in edu_values if str(v) in ALLOWED_EDUCATION_IDS]
     if not wanted_edu:
         raise HTTPException(status_code=500, detail={"msg": "None of education IDs 2,7,11 found in table.", "table": table})
+    if chosen_education_filter != "all":
+        if chosen_education_filter not in wanted_edu:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "msg": "Requested education_filter is not available in RV0231U.",
+                    "education_filter": chosen_education_filter,
+                    "available_filters": sorted(wanted_edu),
+                },
+            )
+        wanted_edu = [chosen_education_filter]
 
     query = []
     for v in vars_:
@@ -1287,10 +1333,16 @@ async def quotas_education(req: QuotaRequest) -> Dict[str, Any]:
     notes = []
     notes.extend(age_notes)
     notes.extend(geo_notes)
+    if chosen_education_filter != "all":
+        notes.append(f"Education filter applied: {chosen_education_filter}.")
     notes.append("Education Unknown is excluded.")
 
     base, cells = compute_cells(f_ids, f_labs, f_pops, req.sample_n)
-    return {"population_total": base, "results": {"education": DimensionResult(base=base, cells=cells, notes=notes).model_dump()}, "meta": {"source": table, "sex_filter": req.sex_filter}}
+    return {
+        "population_total": base,
+        "results": {"education": DimensionResult(base=base, cells=cells, notes=notes).model_dump()},
+        "meta": {"source": table, "sex_filter": req.sex_filter, "education_filter": chosen_education_filter},
+    }
 
 
 # ================= RV069U birth/citizenship by country (AGGREGATED) =================
@@ -1503,6 +1555,16 @@ async def calculate(req: QuotaRequest, x_api_key: Optional[str] = Header(default
     req.dimensions = normalized
 
     chosen_nationality_filter = normalize_nationality_filter(req.nationality_filter)
+    chosen_education_filter = normalize_education_filter(req.education_filter)
+    if chosen_nationality_filter != "all" and chosen_education_filter != "all":
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "msg": "nationality_filter and education_filter cannot be used together.",
+                "nationality_filter": chosen_nationality_filter,
+                "education_filter": chosen_education_filter,
+            },
+        )
     if chosen_nationality_filter != "all":
         unsupported = [d for d in req.dimensions if d != "nationality"]
         if unsupported:
@@ -1511,6 +1573,17 @@ async def calculate(req: QuotaRequest, x_api_key: Optional[str] = Header(default
                 detail={
                     "msg": "nationality_filter is only possible with the Nationality dimension.",
                     "nationality_filter": chosen_nationality_filter,
+                    "unsupported_dimensions": unsupported,
+                },
+            )
+    if chosen_education_filter != "all":
+        unsupported = [d for d in req.dimensions if d != "education"]
+        if unsupported:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "msg": "education_filter is only possible with the Education dimension.",
+                    "education_filter": chosen_education_filter,
                     "unsupported_dimensions": unsupported,
                 },
             )
