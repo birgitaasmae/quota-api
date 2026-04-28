@@ -1201,6 +1201,72 @@ def choose_grouped_table_tallinn_district_values(var: Dict[str, Any]) -> List[st
         raise HTTPException(status_code=400, detail={"msg": "Tallinn district output is not available in this table."})
     return chosen
 
+def build_grouped_source_age_result(
+    req: QuotaRequest,
+    age_keys: List[str],
+    age_label_map: Dict[str, str],
+    pop_by_key: Dict[str, int],
+    sample_n: int,
+    shared_notes: List[str],
+) -> DimensionResult:
+    ordered = []
+    for key in age_keys:
+        if key not in pop_by_key:
+            continue
+        label = clean_value_text(age_label_map.get(key, key))
+        age_range = parse_age_group_range(label)
+        if age_range is None:
+            continue
+        ordered.append((key, label, age_range[0], age_range[1], int(pop_by_key.get(key, 0))))
+
+    step = int(req.age_grouping_years)
+    notes = list(shared_notes)
+
+    if req.custom_age_groups or step <= 5:
+        if req.custom_age_groups:
+            notes.append("Custom age groups cannot split published 5-year source groups, so the displayed age groups follow the source table buckets.")
+        elif step == 1:
+            notes.append("1-year grouping is not available here; the source table is published in 5-year age groups.")
+        out_ids = [item[0] for item in ordered]
+        out_labels = [item[1] for item in ordered]
+        out_pops = [item[4] for item in ordered]
+        base, cells = compute_cells(out_ids, out_labels, out_pops, sample_n)
+        return DimensionResult(base=base, cells=cells, notes=notes)
+
+    buckets: List[Tuple[int, int, List[Tuple[str, str, int, int, int]]]] = []
+    current_start = None
+    current_end = None
+    current_items: List[Tuple[str, str, int, int, int]] = []
+
+    for item in ordered:
+        _, _, start, end, _ = item
+        if current_start is None:
+            current_start = start
+            current_end = start + step - 1
+        if start > current_end:
+            buckets.append((current_start, current_end, current_items))
+            current_start = start
+            current_end = start + step - 1
+            current_items = []
+        current_items.append(item)
+
+    if current_start is not None and current_items:
+        buckets.append((current_start, current_end, current_items))
+
+    out_ids = []
+    out_labels = []
+    out_pops = []
+    for bucket_start, bucket_end, items in buckets:
+        actual_end = max(item[3] for item in items)
+        label = f"{bucket_start}-{actual_end}"
+        out_ids.append(label)
+        out_labels.append(label)
+        out_pops.append(sum(item[4] for item in items))
+
+    notes.append(f"Age groups shown here are built by summing published 5-year source groups into {step}-year buckets when possible.")
+    base, cells = compute_cells(out_ids, out_labels, out_pops, sample_n)
+    return DimensionResult(base=base, cells=cells, notes=notes)
+
 def nationality_group_for_label(label: str) -> Optional[str]:
     t = fold(label)
     if is_totalish(label) or "rahvus kokku" in t or "rahvused kokku" in t:
@@ -1340,10 +1406,14 @@ async def quotas_from_nationality_table_filtered(req: QuotaRequest) -> Dict[str,
             key = a_keys[coords[a_pos]]
             if key in pop_by_key:
                 pop_by_key[key] += value
-        out_ids = [key for key in a_keys if key in pop_by_key]
-        out_labels = [clean_value_text(a_label_map.get(key, key)) for key in out_ids]
-        out_pops = [int(pop_by_key.get(key, 0)) for key in out_ids]
-        results["age_group"] = build_result(out_ids, out_labels, out_pops).model_dump()
+        results["age_group"] = build_grouped_source_age_result(
+            req,
+            a_keys,
+            a_label_map,
+            pop_by_key,
+            req.sample_n,
+            notes,
+        ).model_dump()
 
     if "county" in req.dimensions:
         if district_mode:
@@ -1526,10 +1596,14 @@ async def quotas_from_education_table_filtered(req: QuotaRequest) -> Dict[str, A
             key = a_keys[coords[a_pos]]
             if key in pop_by_key:
                 pop_by_key[key] += int(value)
-        out_ids = [key for key in a_keys if key in pop_by_key]
-        out_labels = [clean_value_text(a_label_map.get(key, key)) for key in out_ids]
-        out_pops = [int(pop_by_key.get(key, 0)) for key in out_ids]
-        results["age_group"] = build_result(out_ids, out_labels, out_pops).model_dump()
+        results["age_group"] = build_grouped_source_age_result(
+            req,
+            a_keys,
+            a_label_map,
+            pop_by_key,
+            req.sample_n,
+            notes,
+        ).model_dump()
 
     if "county" in req.dimensions:
         pop_by_label: Dict[str, int] = {}
